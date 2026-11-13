@@ -15,6 +15,8 @@ export interface OptionContractRecommendation {
   riskReward: string;
   delta: number;
   ivPct: number;
+  recommendedLots?: number;
+  atrDynamic?: boolean;
   dataMode: 'Simulated Black-Scholes (Derived from Spot)' | 'Uploaded Historical Options CSV';
 }
 
@@ -308,6 +310,11 @@ export function mapSignalToOptionContract(params: {
   spot: number;
   dateStr?: string;
   rollingVolPct?: number | null;
+  atr?: number | null;
+  stopAtrMult?: number;
+  targetAtrMult?: number;
+  capital?: number;
+  riskPerTradePct?: number;
   uploadedRows?: UploadedOptionRow[] | null;
   preferredMode?: 'simulated' | 'csv';
 }): OptionContractRecommendation | null {
@@ -330,9 +337,33 @@ export function mapSignalToOptionContract(params: {
 
   const leg = optionType === 'CE' ? atmRow.ce : atmRow.pe;
   const entryPremium = leg.ltp;
-  // Option premium SL (-20%) and Target (+40% -> 1:2 R:R)
-  const stopLoss = Number(Math.max(1, entryPremium * 0.8).toFixed(2));
-  const targetPrice = Number((entryPremium * 1.4).toFixed(2));
+
+  const stopMult = Math.max(0.5, params.stopAtrMult ?? 1.2);
+  const targetMult = Math.max(stopMult * 2.0, params.targetAtrMult ?? 2.4);
+  const rrRatio = targetMult / stopMult;
+
+  let slDist = entryPremium * 0.2;
+  let atrDynamic = false;
+  if (params.atr && params.atr > 0) {
+    const absDelta = Math.max(0.35, Math.min(0.75, Math.abs(leg.delta) || 0.5));
+    const atrOptSl = absDelta * params.atr * stopMult;
+    // Keep SL bounded realistically within [8%, 45%] of entry premium
+    slDist = Math.min(entryPremium * 0.45, Math.max(entryPremium * 0.08, atrOptSl));
+    atrDynamic = true;
+  }
+
+  const stopLoss = Number(Math.max(1, entryPremium - slDist).toFixed(2));
+  const actualSlDist = Math.max(1, entryPremium - stopLoss);
+  const targetPrice = Number((entryPremium + actualSlDist * rrRatio).toFixed(2));
+
+  let recommendedLots = 1;
+  if (params.capital && params.riskPerTradePct) {
+    const maxRiskRupees = (params.capital * params.riskPerTradePct) / 100;
+    const riskPerLot = actualSlDist * BANKNIFTY_LOT_SIZE;
+    if (riskPerLot > 0) {
+      recommendedLots = Math.max(1, Math.floor(maxRiskRupees / riskPerLot));
+    }
+  }
 
   return {
     contractName: `BANKNIFTY ${atmRow.expiry} ${atmRow.strike} ${optionType}`,
@@ -343,9 +374,11 @@ export function mapSignalToOptionContract(params: {
     entryPremium,
     stopLoss,
     targetPrice,
-    riskReward: '1:2.0',
+    riskReward: `1:${rrRatio.toFixed(1)}`,
     delta: leg.delta,
     ivPct: leg.ivPct,
+    recommendedLots,
+    atrDynamic,
     dataMode: chainData.dataMode,
   };
 }

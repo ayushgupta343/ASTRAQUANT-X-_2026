@@ -156,7 +156,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
       {/* Machine Learning Defaults */}
       <div className="rounded-xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-5 space-y-4">
         <h2 className="font-display text-base font-semibold">Random Forest Model Defaults</h2>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
           <div>
             <label className="block text-slate-500 mb-1">Default Trees (n_estimators)</label>
             <input
@@ -179,6 +179,23 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               value={form.ml.maxDepth}
               onChange={(e) =>
                 setForm({ ...form, ml: { ...form.ml, maxDepth: Number(e.target.value) } })
+              }
+              className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent font-mono tabular-nums"
+            />
+          </div>
+          <div>
+            <label className="block text-slate-500 mb-1">Min Conviction Threshold (0.50–0.90)</label>
+            <input
+              type="number"
+              min={0.5}
+              max={0.9}
+              step="0.01"
+              value={form.ml.minConfidenceThreshold ?? 0.65}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  ml: { ...form.ml, minConfidenceThreshold: Number(e.target.value) },
+                })
               }
               className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent font-mono tabular-nums"
             />

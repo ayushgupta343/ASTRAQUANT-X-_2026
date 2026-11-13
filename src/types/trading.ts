@@ -27,6 +27,56 @@ export interface OptionContractRecommendation {
   delta: number;
   ivPct: number;
   dataMode: string;
+  recommendedLots?: number;
+  atrDynamic?: boolean;
+}
+
+export type RiskGuardrailStatusLevel = 'ACTIVE' | 'WARNING' | 'TRIGGERED';
+
+export interface RiskTelemetry {
+  overallStatus: RiskGuardrailStatusLevel;
+  canPlaceManualOrder: boolean;
+  canAutoExecute: boolean;
+  latestSpot: number;
+  latestAtr: number | null;
+  latestAdx: number | null;
+  guardrails: {
+    dailyLossCap: {
+      status: RiskGuardrailStatusLevel;
+      dailyNetPnl: number;
+      limit: number;
+      pctUsed: number;
+      detail: string;
+    };
+    maxOpenPositions: {
+      status: RiskGuardrailStatusLevel;
+      openCount: number;
+      limit: number;
+      detail: string;
+    };
+    adxRegimeFilter: {
+      status: RiskGuardrailStatusLevel;
+      enabled: boolean;
+      currentAdx: number | null;
+      minThreshold: number;
+      detail: string;
+    };
+    consecutiveLossCooldown: {
+      status: RiskGuardrailStatusLevel;
+      enabled: boolean;
+      consecutiveLosses: number;
+      lossLimit: number;
+      candlesRemaining: number;
+      cooldownCandles: number;
+      detail: string;
+    };
+    timeBasedOptionExit: {
+      enabled: boolean;
+      maxHoldCandles: number;
+      openOptionPositionsCount: number;
+      maxCandlesHeld: number;
+    };
+  };
 }
 
 export interface OptionLegQuote {
@@ -100,6 +150,15 @@ export interface EnrichedCandle {
   candleBody: number;
   candleRange: number;
   relVolume: number | null;
+  vwap?: number | null;
+  vwapDistance?: number | null;
+  atr?: number | null;
+  atrNormRange?: number | null;
+  adx?: number | null;
+  htfEma20Slope?: number | null;
+  htfRsi14?: number | null;
+  timeSin?: number;
+  timeCos?: number;
 }
 
 export interface MarketOverviewResponse {
@@ -140,6 +199,12 @@ export interface MarketOverviewResponse {
     ema20: number | null;
     sma50: number | null;
     volatility: number | null;
+    vwap?: number | null;
+    vwapDistance?: number | null;
+    atr?: number | null;
+    adx?: number | null;
+    htfEma20Slope?: number | null;
+    htfRsi14?: number | null;
     trendDirection: string;
   };
   prediction?: {
@@ -147,6 +212,9 @@ export interface MarketOverviewResponse {
     modelId?: number;
     algorithm?: string;
     signal: SignalClass | null;
+    rawSignal?: SignalClass | null;
+    thresholdGated?: boolean;
+    minConfidenceThreshold?: number;
     confidence: number | null;
     predictedMovePct: number | null;
     recommendation: {
@@ -159,6 +227,47 @@ export interface MarketOverviewResponse {
     } | null;
     optionRecommendation?: OptionContractRecommendation | null;
   };
+}
+
+export interface HighConvictionMetrics {
+  minConfidenceThreshold: number;
+  totalTestBars: number;
+  directionalSignals: number;
+  directionalHits: number;
+  buySignals: number;
+  buyHits: number;
+  sellSignals: number;
+  sellHits: number;
+  precision: number;
+  buyPrecision: number;
+  sellPrecision: number;
+  tradeCoveragePct: number;
+  avgDirectionalConfidence: number;
+}
+
+export interface WalkForwardFold {
+  fold: number;
+  trainRange: string;
+  testRange: string;
+  trainSize: number;
+  testSize: number;
+  overallAccuracy: number;
+  balancedAccuracy: number;
+  highConvictionPrecision: number;
+  tradeCoveragePct: number;
+  directionalSignals: number;
+  directionalHits: number;
+}
+
+export interface WalkForwardEvaluation {
+  enabled: boolean;
+  foldCount: number;
+  folds: WalkForwardFold[];
+  meanOverallAccuracy: number;
+  meanHighConvictionPrecision: number;
+  meanTradeCoveragePct: number;
+  totalDirectionalSignals: number;
+  totalDirectionalHits: number;
 }
 
 export interface ModelStatusResponse {
@@ -174,6 +283,8 @@ export interface ModelStatusResponse {
   valSize?: number;
   testSize?: number;
   dateRange?: string;
+  minConfidenceThreshold?: number;
+  walkForwardEnabled?: boolean;
   metrics?: {
     accuracy: number;
     balancedAccuracy: number;
@@ -181,6 +292,8 @@ export interface ModelStatusResponse {
     recall: number;
     f1Score: number;
   };
+  highConviction?: HighConvictionMetrics | null;
+  walkForward?: WalkForwardEvaluation | null;
   confusionMatrix?: number[][];
   classDistribution?: { BUY: number; HOLD: number; SELL: number };
   featureImportance?: Array<{ feature: string; importance: number }>;
@@ -191,6 +304,8 @@ export interface ModelStatusResponse {
     close: number;
     actual: SignalClass;
     predicted: SignalClass;
+    rawPredicted?: SignalClass;
+    thresholdGated?: boolean;
     confidence: number;
     futureReturnPct: number;
   }>;
@@ -261,9 +376,11 @@ export interface PaperPortfolioResponse {
     lots: number | null;
     is_auto_executed: number | null;
     rationale: string | null;
+    opened_candle_ts?: number | null;
     opened_at: string;
     notes: string | null;
   }>;
+  riskTelemetry?: RiskTelemetry;
   updatedAt: string;
 }
 
@@ -287,6 +404,8 @@ export interface PaperOrderRecord {
   lots: number | null;
   is_auto_executed: number | null;
   rationale: string | null;
+  opened_candle_ts?: number | null;
+  exit_reason?: string | null;
   opened_at: string;
   closed_at: string | null;
 }
@@ -304,6 +423,31 @@ export interface PaperTradePrefill {
   lotSize?: number;
   notes?: string;
   rationale?: string;
+}
+
+export interface BacktestSummarySlice {
+  winRatePct: number;
+  profitFactor: number;
+  maxDrawdownPct: number;
+  totalReturnPct: number;
+  netProfit: number;
+  totalTrades: number;
+  sharpeRatio: number;
+}
+
+export interface BacktestBaselineComparison {
+  filtered: BacktestSummarySlice;
+  unfiltered: BacktestSummarySlice;
+  blockedByAdxCount: number;
+  blockedByCooldownCount: number;
+  atrDynamicTradesCount: number;
+  guardrailsApplied: {
+    atrDynamic: boolean;
+    adxFilter: boolean;
+    consecutiveLossCooldown: boolean;
+    adxMinThreshold: number;
+    cooldownCandles: number;
+  };
 }
 
 export interface BacktestRunResult {
@@ -328,6 +472,7 @@ export interface BacktestRunResult {
     avgLossPerTrade: number;
     totalCosts: number;
   };
+  baselineComparison?: BacktestBaselineComparison | null;
   equityCurve: Array<{
     time: string;
     equity: number;
@@ -373,14 +518,27 @@ export interface AppSettings {
     minSamplesSplit: number;
     horizonCandles: number;
     signalThresholdPct: number;
+    minConfidenceThreshold?: number;
+    walkForwardEnabled?: boolean;
   };
   trading: {
     defaultQuantity: number;
     defaultLots: number;
     defaultStopLossPct: number;
     defaultTargetPct: number;
+    riskPerTradePct?: number;
+    stopLossMode?: 'atr_dynamic' | 'fixed_pct';
+    atrStopMult?: number;
+    atrTargetMult?: number;
     maxOpenPositions: number;
     dailyMaxLoss: number;
+    adxChopFilterEnabled?: boolean;
+    adxMinThreshold?: number;
+    consecutiveLossCooldownEnabled?: boolean;
+    consecutiveLossLimit?: number;
+    cooldownCandles?: number;
+    timeBasedOptionExitEnabled?: boolean;
+    optionMaxHoldCandles?: number;
     autoExecuteSignals: boolean;
   };
   dataSource: {
@@ -403,8 +561,9 @@ export interface MarketStreamTickPayload {
   overview: MarketOverviewResponse;
   optionsChain: OptionsChainResponse;
   portfolio: PaperPortfolioResponse;
+  riskTelemetry?: RiskTelemetry;
   latestCandle: EnrichedCandle | null;
   candles?: EnrichedCandle[];
-  streamAutoEvent?: { executed: boolean; contract: string; orderId: number } | null;
+  streamAutoEvent?: { executed?: boolean; contract?: string; orderId?: number; autoClosed?: boolean } | null;
   serverTime: string;
 }

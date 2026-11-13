@@ -18,6 +18,14 @@ export const FEATURE_NAMES = [
   'candleBody',
   'candleRange',
   'volume',
+  'vwapDistance',
+  'atr',
+  'atrNormRange',
+  'adx',
+  'htfEma20Slope',
+  'htfRsi14',
+  'timeSin',
+  'timeCos',
 ] as const;
 
 export type FeatureKey = (typeof FEATURE_NAMES)[number];
@@ -33,12 +41,55 @@ interface TreeNode {
 
 export interface RandomForestArtifact {
   algorithm: string;
+  labelingMode: string;
+  minConfidenceThreshold: number;
   featureNames: string[];
   nEstimators: number;
   maxDepth: number;
   minSamplesSplit: number;
   trees: TreeNode[];
   featureImportance: Array<{ feature: string; importance: number }>;
+}
+
+export interface HighConvictionMetrics {
+  minConfidenceThreshold: number;
+  totalTestBars: number;
+  directionalSignals: number;
+  directionalHits: number;
+  buySignals: number;
+  buyHits: number;
+  sellSignals: number;
+  sellHits: number;
+  precision: number;
+  buyPrecision: number;
+  sellPrecision: number;
+  tradeCoveragePct: number;
+  avgDirectionalConfidence: number;
+}
+
+export interface WalkForwardFold {
+  fold: number;
+  trainRange: string;
+  testRange: string;
+  trainSize: number;
+  testSize: number;
+  overallAccuracy: number;
+  balancedAccuracy: number;
+  highConvictionPrecision: number;
+  tradeCoveragePct: number;
+  directionalSignals: number;
+  directionalHits: number;
+}
+
+export interface WalkForwardEvaluation {
+  enabled: boolean;
+  foldCount: number;
+  folds: WalkForwardFold[];
+  meanOverallAccuracy: number;
+  meanHighConvictionPrecision: number;
+  meanTradeCoveragePct: number;
+  totalDirectionalSignals: number;
+  totalDirectionalHits: number;
 }
 
 export interface TrainingEvaluation {
@@ -48,11 +99,14 @@ export interface TrainingEvaluation {
   valSize: number;
   testSize: number;
   dateRange: string;
+  minConfidenceThreshold: number;
   accuracy: number;
   balancedAccuracy: number;
   precisionMacro: number;
   recallMacro: number;
   f1Macro: number;
+  highConviction: HighConvictionMetrics;
+  walkForward: WalkForwardEvaluation | null;
   confusionMatrix: number[][]; // rows = actual [BUY, HOLD, SELL], cols = predicted [BUY, HOLD, SELL]
   classDistribution: { BUY: number; HOLD: number; SELL: number };
   featureImportance: Array<{ feature: string; importance: number }>;
@@ -63,15 +117,22 @@ export interface TrainingEvaluation {
     close: number;
     actual: SignalClass;
     predicted: SignalClass;
+    rawPredicted: SignalClass;
+    thresholdGated: boolean;
     confidence: number;
     futureReturnPct: number;
   }>;
   artifact: RandomForestArtifact;
 }
 
+export function clampConfidenceThreshold(val?: number): number {
+  if (val === undefined || Number.isNaN(val)) return 0.65;
+  const normalized = val > 1 ? val / 100 : val;
+  return Number(Math.min(0.9, Math.max(0.5, normalized)).toFixed(2));
+}
+
 /**
- * Extracts normalized/scaled feature vector strictly from information available at candle t.
- * Prices are kept as structural inputs alongside stationary oscillators and volatility.
+ * Extracts normalized/scaled feature vector strictly from causal information available at candle t.
  */
 export function extractFeatureVector(c: EnrichedCandle): number[] | null {
   if (
@@ -80,7 +141,13 @@ export function extractFeatureVector(c: EnrichedCandle): number[] | null {
     c.macdSignal === null ||
     c.macdHist === null ||
     c.return1 === null ||
-    c.volatility === null
+    c.volatility === null ||
+    c.vwapDistance === null ||
+    c.atr === null ||
+    c.atrNormRange === null ||
+    c.adx === null ||
+    c.htfEma20Slope === null ||
+    c.htfRsi14 === null
   ) {
     return null;
   }
@@ -98,6 +165,14 @@ export function extractFeatureVector(c: EnrichedCandle): number[] | null {
     c.candleBody,
     c.candleRange,
     c.relVolume ?? 1.0,
+    c.vwapDistance,
+    c.atr,
+    c.atrNormRange,
+    c.adx,
+    c.htfEma20Slope,
+    c.htfRsi14,
+    c.timeSin,
+    c.timeCos,
   ];
 }
 
@@ -232,8 +307,16 @@ function predictTreeProbs(node: TreeNode, x: number[]): [number, number, number]
 
 export function predictWithForest(
   artifact: RandomForestArtifact,
-  x: number[]
-): { signal: SignalClass; probabilities: Record<SignalClass, number>; confidence: number } {
+  x: number[],
+  minConfidenceOverride?: number
+): {
+  signal: SignalClass;
+  rawSignal: SignalClass;
+  thresholdGated: boolean;
+  minConfidenceThreshold: number;
+  probabilities: Record<SignalClass, number>;
+  confidence: number;
+} {
   const avg: [number, number, number] = [0, 0, 0];
   const nTrees = artifact.trees.length || 1;
   for (const tree of artifact.trees) {
@@ -252,8 +335,18 @@ export function predictWithForest(
     }
   }
 
+  const threshold = clampConfidenceThreshold(minConfidenceOverride ?? artifact.minConfidenceThreshold);
+  const rawSignal = CLASS_LABELS[bestClassIdx];
+  const isDirectional = bestClassIdx === 0 || bestClassIdx === 2;
+  const passesThreshold = isDirectional && maxProb >= threshold;
+  const signal: SignalClass = passesThreshold ? rawSignal : 'HOLD';
+  const thresholdGated = isDirectional && !passesThreshold;
+
   return {
-    signal: CLASS_LABELS[bestClassIdx],
+    signal,
+    rawSignal,
+    thresholdGated,
+    minConfidenceThreshold: threshold,
     probabilities: {
       BUY: Number((avg[0] * 100).toFixed(2)),
       HOLD: Number((avg[1] * 100).toFixed(2)),
@@ -276,107 +369,58 @@ function mulberry32(seed: number) {
   };
 }
 
-/**
- * Full Chronological Random Forest Pipeline:
- * - Calculates indicators causally
- * - Creates 3-candle (15m) forward return labels (+0.10% BUY, -0.10% SELL, else HOLD)
- * - Chronologically splits 70% Train / 15% Validation / 15% Test (never shuffled)
- * - Evaluates strictly on held-out Test set
- */
-export function trainRandomForestPipeline(
-  rawCandles: CandleRow[],
-  options?: { nEstimators?: number; maxDepth?: number; minSamplesSplit?: number; horizonCandles?: number; thresholdPct?: number }
-): TrainingEvaluation {
-  const nEstimators = options?.nEstimators ?? 30;
-  const maxDepth = options?.maxDepth ?? 6;
-  const minSamplesSplit = options?.minSamplesSplit ?? 8;
-  const horizon = options?.horizonCandles ?? 3;
-  const thresh = options?.thresholdPct ?? 0.001; // 0.10%
+interface SampleRow {
+  x: number[];
+  y: number; // 0=BUY, 1=HOLD, 2=SELL
+  candle: EnrichedCandle;
+  futureReturnPct: number;
+}
 
-  const enriched = calculateIndicators(rawCandles);
-
-  interface SampleRow {
-    x: number[];
-    y: number; // 0=BUY, 1=HOLD, 2=SELL
-    candle: EnrichedCandle;
-    futureReturnPct: number;
+function fitForestOnSamples(
+  trainSamples: SampleRow[],
+  params: {
+    nEstimators: number;
+    maxDepth: number;
+    minSamplesSplit: number;
+    minConfidenceThreshold: number;
+    seed: number;
   }
-
-  const samples: SampleRow[] = [];
-  const classDist = { BUY: 0, HOLD: 0, SELL: 0 };
-
-  // Exclude last `horizon` candles because future close at t+3 does not exist
-  for (let i = 0; i < enriched.length - horizon; i++) {
-    const vec = extractFeatureVector(enriched[i]);
-    if (!vec) continue;
-
-    const futureRet = (enriched[i + horizon].close - enriched[i].close) / enriched[i].close;
-    let labelIdx = 1; // HOLD
-    if (futureRet > thresh) {
-      labelIdx = 0; // BUY
-      classDist.BUY++;
-    } else if (futureRet < -thresh) {
-      labelIdx = 2; // SELL
-      classDist.SELL++;
-    } else {
-      classDist.HOLD++;
-    }
-
-    samples.push({
-      x: vec,
-      y: labelIdx,
-      candle: enriched[i],
-      futureReturnPct: Number((futureRet * 100).toFixed(4)),
-    });
-  }
-
-  if (samples.length < 120) {
-    throw new Error(
-      `Insufficient usable samples after indicator warm-up (${samples.length} found, minimum 120 required). Upload at least 200 5-minute candles.`
-    );
-  }
-
-  // Chronological 70% / 15% / 15% split — NEVER shuffled
-  const trainEnd = Math.floor(samples.length * 0.7);
-  const valEnd = Math.floor(samples.length * 0.85);
-
-  const trainSamples = samples.slice(0, trainEnd);
-  const valSamples = samples.slice(trainEnd, valEnd);
-  const testSamples = samples.slice(valEnd);
-
+): RandomForestArtifact {
   const XTrain = trainSamples.map((s) => s.x);
   const yTrain = trainSamples.map((s) => s.y);
-
-  // Balanced class weights so minority BUY/SELL signals aren't ignored
-  const trainCounts: [number, number, number] = [0, 0, 0];
-  for (const label of yTrain) trainCounts[label]++;
   const nTrain = yTrain.length;
-  const classWeights: [number, number, number] = [
-    trainCounts[0] > 0 ? nTrain / (3 * trainCounts[0]) : 1,
-    trainCounts[1] > 0 ? nTrain / (3 * trainCounts[1]) : 1,
-    trainCounts[2] > 0 ? nTrain / (3 * trainCounts[2]) : 1,
-  ];
-  const sampleWeights = yTrain.map((label) => classWeights[label]);
-
   const numFeatures = FEATURE_NAMES.length;
   const maxFeatures = Math.max(2, Math.floor(Math.sqrt(numFeatures)));
   const importanceAccum = new Array(numFeatures).fill(0);
-  const rng = mulberry32(20260413);
+  const rng = mulberry32(params.seed);
 
   const trees: TreeNode[] = [];
-  for (let t = 0; t < nEstimators; t++) {
+  for (let t = 0; t < params.nEstimators; t++) {
     const bootIndices: number[] = [];
+    const bootCounts: [number, number, number] = [0, 0, 0];
     for (let i = 0; i < nTrain; i++) {
-      bootIndices.push(Math.floor(rng() * nTrain));
+      const idx = Math.floor(rng() * nTrain);
+      bootIndices.push(idx);
+      bootCounts[yTrain[idx]]++;
     }
+
+    // class_weight="balanced_subsample": inverse class-frequency weighting computed per bootstrap subsample
+    const activeClassCount = bootCounts.filter((cnt) => cnt > 0).length || 1;
+    const bootClassWeights: [number, number, number] = [
+      bootCounts[0] > 0 ? nTrain / (activeClassCount * bootCounts[0]) : 1,
+      bootCounts[1] > 0 ? nTrain / (activeClassCount * bootCounts[1]) : 1,
+      bootCounts[2] > 0 ? nTrain / (activeClassCount * bootCounts[2]) : 1,
+    ];
+    const sampleWeights = yTrain.map((label) => bootClassWeights[label]);
+
     const tree = buildTree(
       XTrain,
       yTrain,
       sampleWeights,
       bootIndices,
       0,
-      maxDepth,
-      minSamplesSplit,
+      params.maxDepth,
+      params.minSamplesSplit,
       maxFeatures,
       importanceAccum,
       rng
@@ -390,17 +434,24 @@ export function trainRandomForestPipeline(
     importance: Number(((importanceAccum[idx] / totalImp) * 100).toFixed(2)),
   })).sort((a, b) => b.importance - a.importance);
 
-  const artifact: RandomForestArtifact = {
-    algorithm: 'Random Forest Classifier (CART Ensemble)',
+  return {
+    algorithm: 'Random Forest Classifier (Causal + High-Conviction CART Ensemble)',
+    labelingMode: 'Volatility-Adaptive ±0.75×ATR(14)/Close (3-Bar Horizon)',
+    minConfidenceThreshold: params.minConfidenceThreshold,
     featureNames: [...FEATURE_NAMES],
-    nEstimators,
-    maxDepth,
-    minSamplesSplit,
+    nEstimators: params.nEstimators,
+    maxDepth: params.maxDepth,
+    minSamplesSplit: params.minSamplesSplit,
     trees,
     featureImportance,
   };
+}
 
-  // Evaluate strictly on chronological held-out Test set
+function evaluateOnSamples(
+  artifact: RandomForestArtifact,
+  testSamples: SampleRow[],
+  minConfidenceThreshold: number
+) {
   const confusionMatrix = [
     [0, 0, 0],
     [0, 0, 0],
@@ -409,19 +460,44 @@ export function trainRandomForestPipeline(
   const predictionHistory: TrainingEvaluation['predictionHistory'] = [];
   let correct = 0;
 
+  let directionalSignals = 0;
+  let directionalHits = 0;
+  let buySignals = 0;
+  let buyHits = 0;
+  let sellSignals = 0;
+  let sellHits = 0;
+  let dirConfidenceSum = 0;
+
   for (const sample of testSamples) {
-    const pred = predictWithForest(artifact, sample.x);
+    const pred = predictWithForest(artifact, sample.x, minConfidenceThreshold);
     const predIdx = CLASS_LABELS.indexOf(pred.signal);
+    const actualLabel = CLASS_LABELS[sample.y];
     confusionMatrix[sample.y][predIdx]++;
     if (predIdx === sample.y) correct++;
+
+    if (pred.signal === 'BUY' || pred.signal === 'SELL') {
+      directionalSignals++;
+      dirConfidenceSum += pred.confidence;
+      if (pred.signal === actualLabel) directionalHits++;
+
+      if (pred.signal === 'BUY') {
+        buySignals++;
+        if (actualLabel === 'BUY') buyHits++;
+      } else {
+        sellSignals++;
+        if (actualLabel === 'SELL') sellHits++;
+      }
+    }
 
     predictionHistory.push({
       timestamp: sample.candle.timestamp,
       date_str: sample.candle.date_str,
       time_str: sample.candle.time_str,
       close: sample.candle.close,
-      actual: CLASS_LABELS[sample.y],
+      actual: actualLabel,
       predicted: pred.signal,
+      rawPredicted: pred.rawSignal,
+      thresholdGated: pred.thresholdGated,
       confidence: pred.confidence,
       futureReturnPct: sample.futureReturnPct,
     });
@@ -456,6 +532,178 @@ export function trainRandomForestPipeline(
   const f1Macro = (f1Sum / denom) * 100;
   const balancedAccuracy = recallMacro;
 
+  const highConviction: HighConvictionMetrics = {
+    minConfidenceThreshold,
+    totalTestBars: testSamples.length,
+    directionalSignals,
+    directionalHits,
+    buySignals,
+    buyHits,
+    sellSignals,
+    sellHits,
+    precision: directionalSignals > 0 ? Number(((directionalHits / directionalSignals) * 100).toFixed(2)) : 0,
+    buyPrecision: buySignals > 0 ? Number(((buyHits / buySignals) * 100).toFixed(2)) : 0,
+    sellPrecision: sellSignals > 0 ? Number(((sellHits / sellSignals) * 100).toFixed(2)) : 0,
+    tradeCoveragePct: Number(((directionalSignals / nTest) * 100).toFixed(2)),
+    avgDirectionalConfidence:
+      directionalSignals > 0 ? Number((dirConfidenceSum / directionalSignals).toFixed(2)) : 0,
+  };
+
+  return {
+    accuracy: Number(accuracy.toFixed(2)),
+    balancedAccuracy: Number(balancedAccuracy.toFixed(2)),
+    precisionMacro: Number(precisionMacro.toFixed(2)),
+    recallMacro: Number(recallMacro.toFixed(2)),
+    f1Macro: Number(f1Macro.toFixed(2)),
+    confusionMatrix,
+    highConviction,
+    predictionHistory,
+  };
+}
+
+/**
+ * Full Chronological Random Forest Pipeline:
+ * - Calculates 21 causal features (VWAP distance, ATR, ATR-norm range, ADX, 15m HTF EMA20 slope & RSI14, NSE session sin/cos)
+ * - Volatility-adaptive 3-candle target threshold (±0.75 × ATR(14) / Close)
+ * - Chronologically splits 70% Train / 15% Validation / 15% Test (never shuffled)
+ * - Optional rolling walk-forward validation across chronological folds
+ */
+export function trainRandomForestPipeline(
+  rawCandles: CandleRow[],
+  options?: {
+    nEstimators?: number;
+    maxDepth?: number;
+    minSamplesSplit?: number;
+    horizonCandles?: number;
+    minConfidenceThreshold?: number;
+    walkForward?: boolean;
+  }
+): TrainingEvaluation {
+  const nEstimators = options?.nEstimators ?? 30;
+  const maxDepth = options?.maxDepth ?? 6;
+  const minSamplesSplit = options?.minSamplesSplit ?? 8;
+  const horizon = options?.horizonCandles ?? 3;
+  const minConfidenceThreshold = clampConfidenceThreshold(options?.minConfidenceThreshold);
+  const enableWalkForward = Boolean(options?.walkForward);
+
+  const enriched = calculateIndicators(rawCandles);
+
+  const samples: SampleRow[] = [];
+  const classDist = { BUY: 0, HOLD: 0, SELL: 0 };
+
+  // Exclude last `horizon` candles because future close at t+3 does not exist
+  for (let i = 0; i < enriched.length - horizon; i++) {
+    const cur = enriched[i];
+    const vec = extractFeatureVector(cur);
+    if (!vec || cur.atr === null || cur.close <= 0) continue;
+
+    const futureRet = (enriched[i + horizon].close - cur.close) / cur.close;
+    // Volatility-adaptive threshold scaled by ATR(14)/Close
+    const adaptiveThresh = (0.75 * cur.atr) / cur.close;
+
+    let labelIdx = 1; // HOLD
+    if (futureRet > adaptiveThresh) {
+      labelIdx = 0; // BUY
+      classDist.BUY++;
+    } else if (futureRet < -adaptiveThresh) {
+      labelIdx = 2; // SELL
+      classDist.SELL++;
+    } else {
+      classDist.HOLD++;
+    }
+
+    samples.push({
+      x: vec,
+      y: labelIdx,
+      candle: cur,
+      futureReturnPct: Number((futureRet * 100).toFixed(4)),
+    });
+  }
+
+  if (samples.length < 120) {
+    throw new Error(
+      `Insufficient usable samples after causal indicator & 15m HTF warm-up (${samples.length} found, minimum 120 required). Upload at least 200 5-minute candles.`
+    );
+  }
+
+  // Chronological 70% / 15% / 15% split — NEVER shuffled
+  const trainEnd = Math.floor(samples.length * 0.7);
+  const valEnd = Math.floor(samples.length * 0.85);
+
+  const trainSamples = samples.slice(0, trainEnd);
+  const valSamples = samples.slice(trainEnd, valEnd);
+  const testSamples = samples.slice(valEnd);
+
+  const artifact = fitForestOnSamples(trainSamples, {
+    nEstimators,
+    maxDepth,
+    minSamplesSplit,
+    minConfidenceThreshold,
+    seed: 20260413,
+  });
+
+  const testEval = evaluateOnSamples(artifact, testSamples, minConfidenceThreshold);
+
+  let walkForward: WalkForwardEvaluation | null = null;
+  if (enableWalkForward) {
+    const foldCount = samples.length >= 400 ? 4 : 3;
+    const initialTrainSize = Math.floor(samples.length * 0.5);
+    const foldSize = Math.floor((samples.length - initialTrainSize) / foldCount);
+    const folds: WalkForwardFold[] = [];
+
+    for (let f = 0; f < foldCount; f++) {
+      const testStart = initialTrainSize + f * foldSize;
+      const testEnd = f === foldCount - 1 ? samples.length : testStart + foldSize;
+      const wfTrain = samples.slice(0, testStart);
+      const wfTest = samples.slice(testStart, testEnd);
+      if (wfTrain.length < 60 || wfTest.length < 15) continue;
+
+      const wfArtifact = fitForestOnSamples(wfTrain, {
+        nEstimators,
+        maxDepth,
+        minSamplesSplit,
+        minConfidenceThreshold,
+        seed: 20260413 + (f + 1) * 97,
+      });
+      const wfEval = evaluateOnSamples(wfArtifact, wfTest, minConfidenceThreshold);
+      folds.push({
+        fold: f + 1,
+        trainRange: `${wfTrain[0].candle.date_str} → ${wfTrain[wfTrain.length - 1].candle.date_str}`,
+        testRange: `${wfTest[0].candle.date_str} → ${wfTest[wfTest.length - 1].candle.date_str}`,
+        trainSize: wfTrain.length,
+        testSize: wfTest.length,
+        overallAccuracy: wfEval.accuracy,
+        balancedAccuracy: wfEval.balancedAccuracy,
+        highConvictionPrecision: wfEval.highConviction.precision,
+        tradeCoveragePct: wfEval.highConviction.tradeCoveragePct,
+        directionalSignals: wfEval.highConviction.directionalSignals,
+        directionalHits: wfEval.highConviction.directionalHits,
+      });
+    }
+
+    const totalDirectionalSignals = folds.reduce((a, b) => a + b.directionalSignals, 0);
+    const totalDirectionalHits = folds.reduce((a, b) => a + b.directionalHits, 0);
+    const meanOverallAccuracy =
+      folds.length > 0 ? Number((folds.reduce((a, b) => a + b.overallAccuracy, 0) / folds.length).toFixed(2)) : 0;
+    const meanTradeCoveragePct =
+      folds.length > 0 ? Number((folds.reduce((a, b) => a + b.tradeCoveragePct, 0) / folds.length).toFixed(2)) : 0;
+    const meanHighConvictionPrecision =
+      totalDirectionalSignals > 0
+        ? Number(((totalDirectionalHits / totalDirectionalSignals) * 100).toFixed(2))
+        : 0;
+
+    walkForward = {
+      enabled: true,
+      foldCount: folds.length,
+      folds,
+      meanOverallAccuracy,
+      meanHighConvictionPrecision,
+      meanTradeCoveragePct,
+      totalDirectionalSignals,
+      totalDirectionalHits,
+    };
+  }
+
   return {
     datasetSize: rawCandles.length,
     usableSamples: samples.length,
@@ -463,15 +711,18 @@ export function trainRandomForestPipeline(
     valSize: valSamples.length,
     testSize: testSamples.length,
     dateRange: `${samples[0].candle.date_str} to ${samples[samples.length - 1].candle.date_str}`,
-    accuracy: Number(accuracy.toFixed(2)),
-    balancedAccuracy: Number(balancedAccuracy.toFixed(2)),
-    precisionMacro: Number(precisionMacro.toFixed(2)),
-    recallMacro: Number(recallMacro.toFixed(2)),
-    f1Macro: Number(f1Macro.toFixed(2)),
-    confusionMatrix,
+    minConfidenceThreshold,
+    accuracy: testEval.accuracy,
+    balancedAccuracy: testEval.balancedAccuracy,
+    precisionMacro: testEval.precisionMacro,
+    recallMacro: testEval.recallMacro,
+    f1Macro: testEval.f1Macro,
+    highConviction: testEval.highConviction,
+    walkForward,
+    confusionMatrix: testEval.confusionMatrix,
     classDistribution: classDist,
-    featureImportance,
-    predictionHistory: predictionHistory.slice(-40).reverse(),
+    featureImportance: artifact.featureImportance,
+    predictionHistory: testEval.predictionHistory.slice(-40).reverse(),
     artifact,
   };
 }
@@ -481,6 +732,8 @@ export interface GeneratedSignal {
   date_str: string;
   time_str: string;
   signal_type: SignalClass;
+  raw_signal_type: SignalClass;
+  threshold_gated: boolean;
   market_price: number;
   entry_price: number;
   stop_loss: number;
@@ -500,17 +753,19 @@ export interface GeneratedSignal {
  */
 export function generateSignalForCandle(
   artifact: RandomForestArtifact,
-  candle: EnrichedCandle
+  candle: EnrichedCandle,
+  minConfidenceOverride?: number
 ): GeneratedSignal | null {
   const vec = extractFeatureVector(candle);
   if (!vec || candle.rsi === null || candle.macd === null || candle.macdSignal === null || candle.macdHist === null) {
     return null;
   }
 
-  const pred = predictWithForest(artifact, vec);
+  const pred = predictWithForest(artifact, vec, minConfidenceOverride);
   const price = candle.close;
-  // Adaptive risk buffer based on 5-minute rolling volatility or candle range (floor 0.18%, cap 0.75%)
-  const volPct = Math.min(0.0075, Math.max(0.0018, ((candle.volatility ?? 0.15) * 1.8) / 100));
+  // Adaptive risk buffer anchored to ATR(14) when available, bounded within 0.18%..0.75%
+  const atrPct = candle.atr && price > 0 ? (candle.atr * 1.2) / price : ((candle.volatility ?? 0.15) * 1.8) / 100;
+  const volPct = Math.min(0.0075, Math.max(0.0018, atrPct));
   const slDist = price * volPct;
   const targetDist = slDist * 2.0; // 1:2 Risk-Reward baseline
 
@@ -533,31 +788,34 @@ export function generateSignalForCandle(
   }
 
   const trendText =
-    candle.ema20 !== null && candle.sma50 !== null
-      ? candle.ema20 > candle.sma50
-        ? 'EMA(20) above SMA(50) bullish structure'
-        : 'EMA(20) below SMA(50) bearish structure'
-      : 'Moving average trend forming';
+    candle.adx !== null
+      ? `ADX(14) ${candle.adx} (${candle.adx >= 22 ? 'trending' : 'range-bound'})`
+      : 'Trend forming';
 
-  const rsiText =
-    candle.rsi >= 65
-      ? `RSI(14) elevated at ${candle.rsi}`
-      : candle.rsi <= 35
-      ? `RSI(14) oversold at ${candle.rsi}`
-      : `RSI(14) neutral at ${candle.rsi}`;
+  const vwapText =
+    candle.vwapDistance !== null
+      ? `VWAP dist ${candle.vwapDistance >= 0 ? '+' : ''}${candle.vwapDistance}%`
+      : '';
 
-  const macdText =
-    candle.macdHist > 0
-      ? `MACD histogram positive (+${candle.macdHist})`
-      : `MACD histogram negative (${candle.macdHist})`;
+  const htfText =
+    candle.htfRsi14 !== null
+      ? `15m HTF RSI ${candle.htfRsi14}`
+      : '';
 
-  const reason = `Random Forest outputs ${pred.signal} (${pred.confidence}% confidence; P(BUY)=${pred.probabilities.BUY}%, P(SELL)=${pred.probabilities.SELL}%). ${rsiText}; ${macdText}; ${trendText}.`;
+  const threshPct = Math.round(pred.minConfidenceThreshold * 100);
+  const gateText = pred.thresholdGated
+    ? `Raw ${pred.rawSignal} (${pred.confidence}%) gated to HOLD (<${threshPct}% conviction threshold)`
+    : `${pred.signal} (${pred.confidence}% confidence >= ${threshPct}% gate)`;
+
+  const reason = `Random Forest: ${gateText}; P(BUY)=${pred.probabilities.BUY}%, P(SELL)=${pred.probabilities.SELL}%. RSI(14) ${candle.rsi}, ${trendText}, ${vwapText}, ${htfText}.`;
 
   return {
     timestamp: candle.timestamp,
     date_str: candle.date_str,
     time_str: candle.time_str,
     signal_type: pred.signal,
+    raw_signal_type: pred.rawSignal,
+    threshold_gated: pred.thresholdGated,
     market_price: price,
     entry_price: price,
     stop_loss: stopLoss,

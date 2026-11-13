@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { AlertCircle, RotateCcw, Wallet, Zap } from 'lucide-react';
+import { AlertCircle, AlertTriangle, RotateCcw, ShieldCheck, Wallet, Zap } from 'lucide-react';
 import {
   AppSettings,
   AutoExecutionLog,
@@ -7,6 +7,8 @@ import {
   PaperOrderRecord,
   PaperPortfolioResponse,
   PaperTradePrefill,
+  RiskGuardrailStatusLevel,
+  RiskTelemetry,
 } from '../types/trading';
 
 interface PaperTradingPageProps {
@@ -14,6 +16,7 @@ interface PaperTradingPageProps {
   history: PaperOrderRecord[];
   optionsChain: OptionsChainResponse | null;
   settings: AppSettings | null;
+  riskTelemetry: RiskTelemetry | null;
   prefillOrder: PaperTradePrefill | null;
   autoExecuteEnabled: boolean;
   autoLogs: AutoExecutionLog[];
@@ -35,6 +38,17 @@ interface PaperTradingPageProps {
   }) => Promise<void>;
   onCloseOrder: (orderId: number, exitPrice?: number) => Promise<void>;
   onResetPortfolio: () => Promise<void>;
+  onResetCooldown: () => Promise<void>;
+}
+
+function statusBadgeStyle(status: RiskGuardrailStatusLevel): string {
+  if (status === 'TRIGGERED') {
+    return 'border-red-500/40 bg-red-500/15 text-red-600 dark:text-red-400';
+  }
+  if (status === 'WARNING') {
+    return 'border-amber-500/40 bg-amber-500/15 text-amber-600 dark:text-amber-400';
+  }
+  return 'border-emerald-500/40 bg-emerald-500/15 text-emerald-600 dark:text-emerald-400';
 }
 
 export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
@@ -42,6 +56,7 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
   history,
   optionsChain,
   settings,
+  riskTelemetry,
   prefillOrder,
   autoExecuteEnabled,
   autoLogs,
@@ -49,6 +64,7 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
   onPlaceOrder,
   onCloseOrder,
   onResetPortfolio,
+  onResetCooldown,
 }) => {
   const defaultAtm = optionsChain?.atmStrike ?? Math.round((portfolio?.markPrice ?? 53760) / 100) * 100;
   const lotSize = optionsChain?.lotSize ?? 15;
@@ -65,15 +81,13 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
   const [lots, setLots] = useState<number>(prefillOrder?.lots ?? 1);
   const [indexQty, setIndexQty] = useState<number>(15);
 
-  const findChainPremium = (targetStrike: number, optType: 'CE' | 'PE') => {
+  const findChainOption = (targetStrike: number, optType: 'CE' | 'PE') => {
     const row = optionsChain?.chain.find((r) => r.strike === targetStrike);
-    if (!row) return 260;
-    return optType === 'CE' ? row.ce.ltp : row.pe.ltp;
+    if (!row) return { ltp: 260, delta: optType === 'CE' ? 0.5 : -0.5 };
+    return optType === 'CE' ? row.ce : row.pe;
   };
 
-  const initialPrem = prefillOrder
-    ? prefillOrder.entry
-    : findChainPremium(defaultAtm, 'CE');
+  const initialPrem = prefillOrder ? prefillOrder.entry : findChainOption(defaultAtm, 'CE').ltp;
 
   const [entryPrice, setEntryPrice] = useState<number>(initialPrem);
   const [stopLoss, setStopLoss] = useState<number>(
@@ -87,6 +101,7 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
 
   const [submitting, setSubmitting] = useState(false);
   const [togglingAuto, setTogglingAuto] = useState(false);
+  const [resettingCooldown, setResettingCooldown] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -108,8 +123,27 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
   }, [prefillOrder, defaultAtm, optionsChain?.expiry]);
 
   const syncOptionLevels = (nextStrike: number, nextOptType: 'CE' | 'PE', nextSide: 'BUY' | 'SELL') => {
-    const prem = findChainPremium(nextStrike, nextOptType);
+    const leg = findChainOption(nextStrike, nextOptType);
+    const prem = leg.ltp;
     setEntryPrice(prem);
+
+    const useAtr = settings?.trading.stopLossMode === 'atr_dynamic' && (riskTelemetry?.latestAtr ?? 0) > 0;
+    if (useAtr) {
+      const stopMult = settings?.trading.atrStopMult ?? 1.2;
+      const targetMult = Math.max(stopMult * 2, settings?.trading.atrTargetMult ?? 2.4);
+      const rawSlDist = Math.abs(leg.delta || 0.5) * (riskTelemetry?.latestAtr ?? 100) * stopMult;
+      const slDist = Math.min(prem * 0.45, Math.max(prem * 0.08, rawSlDist));
+      const tpDist = slDist * (targetMult / Math.max(0.1, stopMult));
+      if (nextSide === 'BUY') {
+        setStopLoss(Number(Math.max(1, prem - slDist).toFixed(2)));
+        setTargetPrice(Number((prem + tpDist).toFixed(2)));
+      } else {
+        setStopLoss(Number((prem + slDist).toFixed(2)));
+        setTargetPrice(Number(Math.max(1, prem - tpDist).toFixed(2)));
+      }
+      return;
+    }
+
     if (nextSide === 'BUY') {
       setStopLoss(Number(Math.max(1, prem * 0.8).toFixed(2)));
       setTargetPrice(Number((prem * 1.4).toFixed(2)));
@@ -126,16 +160,32 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
     } else {
       const spot = portfolio?.markPrice ?? 53760;
       setEntryPrice(spot);
-      setStopLoss(
-        side === 'BUY'
-          ? Number((spot * 0.9965).toFixed(2))
-          : Number((spot * 1.0035).toFixed(2))
-      );
-      setTargetPrice(
-        side === 'BUY'
-          ? Number((spot * 1.007).toFixed(2))
-          : Number((spot * 0.993).toFixed(2))
-      );
+      const atr = riskTelemetry?.latestAtr;
+      if (settings?.trading.stopLossMode === 'atr_dynamic' && atr && atr > 0) {
+        const stopMult = settings?.trading.atrStopMult ?? 1.2;
+        const targetMult = Math.max(stopMult * 2, settings?.trading.atrTargetMult ?? 2.4);
+        setStopLoss(
+          side === 'BUY'
+            ? Number((spot - atr * stopMult).toFixed(2))
+            : Number((spot + atr * stopMult).toFixed(2))
+        );
+        setTargetPrice(
+          side === 'BUY'
+            ? Number((spot + atr * targetMult).toFixed(2))
+            : Number((spot - atr * targetMult).toFixed(2))
+        );
+      } else {
+        setStopLoss(
+          side === 'BUY'
+            ? Number((spot * 0.9965).toFixed(2))
+            : Number((spot * 1.0035).toFixed(2))
+        );
+        setTargetPrice(
+          side === 'BUY'
+            ? Number((spot * 1.007).toFixed(2))
+            : Number((spot * 0.993).toFixed(2))
+        );
+      }
     }
   };
 
@@ -145,16 +195,47 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
       syncOptionLevels(strike, optionType, nextSide);
     } else {
       const base = entryPrice || portfolio?.markPrice || 53760;
-      setStopLoss(
-        nextSide === 'BUY'
-          ? Number((base * 0.9965).toFixed(2))
-          : Number((base * 1.0035).toFixed(2))
-      );
-      setTargetPrice(
-        nextSide === 'BUY'
-          ? Number((base * 1.007).toFixed(2))
-          : Number((base * 0.993).toFixed(2))
-      );
+      const atr = riskTelemetry?.latestAtr;
+      if (settings?.trading.stopLossMode === 'atr_dynamic' && atr && atr > 0) {
+        const stopMult = settings?.trading.atrStopMult ?? 1.2;
+        const targetMult = Math.max(stopMult * 2, settings?.trading.atrTargetMult ?? 2.4);
+        setStopLoss(
+          nextSide === 'BUY'
+            ? Number((base - atr * stopMult).toFixed(2))
+            : Number((base + atr * stopMult).toFixed(2))
+        );
+        setTargetPrice(
+          nextSide === 'BUY'
+            ? Number((base + atr * targetMult).toFixed(2))
+            : Number((base - atr * targetMult).toFixed(2))
+        );
+      } else {
+        setStopLoss(
+          nextSide === 'BUY'
+            ? Number((base * 0.9965).toFixed(2))
+            : Number((base * 1.0035).toFixed(2))
+        );
+        setTargetPrice(
+          nextSide === 'BUY'
+            ? Number((base * 1.007).toFixed(2))
+            : Number((base * 0.993).toFixed(2))
+        );
+      }
+    }
+  };
+
+  // Volatility-Adjusted Lot Sizing calculation
+  const riskPerTradePct = settings?.trading.riskPerTradePct ?? 1.0;
+  const maxRiskBudget = ((portfolio?.totalEquity ?? 100000) * riskPerTradePct) / 100;
+  const slDistance = Math.max(1, Math.abs(entryPrice - stopLoss));
+  const riskPerSingleLot = slDistance * lotSize;
+  const volatilitySizedLots = Math.max(1, Math.floor(maxRiskBudget / riskPerSingleLot));
+
+  const applyVolatilitySizing = () => {
+    if (instrumentType === 'OPTION') {
+      setLots(volatilitySizedLots);
+    } else {
+      setIndexQty(volatilitySizedLots * lotSize);
     }
   };
 
@@ -199,6 +280,15 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
     }
   };
 
+  const handleResetCooldownClick = async () => {
+    setResettingCooldown(true);
+    try {
+      await onResetCooldown();
+    } finally {
+      setResettingCooldown(false);
+    }
+  };
+
   const optionTotalQty = lots * lotSize;
   const capitalRequired =
     instrumentType === 'OPTION'
@@ -208,8 +298,10 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
       : entryPrice * indexQty * 0.1;
 
   const maxOpenPos = settings?.trading.maxOpenPositions ?? 3;
-  const dailyMaxLoss = settings?.trading.dailyMaxLoss ?? 5000;
+  const dailyMaxLoss = settings?.trading.dailyMaxLoss ?? 3000;
   const closedOrders = history.filter((o) => o.status === 'CLOSED');
+  const g = riskTelemetry?.guardrails;
+  const isKillSwitchActive = g?.dailyLossCap.status === 'TRIGGERED';
 
   return (
     <div className="space-y-6">
@@ -245,6 +337,102 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
             <RotateCcw className="w-3.5 h-3.5" />
             <span>Reset (₹1,00,000)</span>
           </button>
+        </div>
+      </div>
+
+      {/* Live Risk Guardrail Status Strip */}
+      <div className="rounded-xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-4 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-xs font-semibold">
+            {riskTelemetry?.overallStatus === 'TRIGGERED' ? (
+              <AlertTriangle className="w-4 h-4 text-red-500" />
+            ) : (
+              <ShieldCheck className="w-4 h-4 text-emerald-500" />
+            )}
+            <span>Pre-Trade Risk &amp; Circuit-Breaker Status</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            {g?.timeBasedOptionExit && (
+              <span className="text-[11px] font-mono text-slate-500">
+                Option Time Exit: {g.timeBasedOptionExit.enabled ? `${g.timeBasedOptionExit.maxHoldCandles} candles (${g.timeBasedOptionExit.maxHoldCandles * 5}m)` : 'OFF'}
+              </span>
+            )}
+            <button
+              type="button"
+              disabled={resettingCooldown}
+              onClick={handleResetCooldownClick}
+              className="px-2.5 py-1 rounded border border-slate-300 dark:border-slate-700 hover:border-sky-500 text-[11px] font-medium flex items-center gap-1"
+            >
+              <RotateCcw className="w-3 h-3 text-sky-500" />
+              <span>{resettingCooldown ? 'Resetting...' : 'Reset Cooldown'}</span>
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 text-xs">
+          <div className="rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="text-[11px] text-slate-500">Daily Loss Cap</div>
+              <div className="font-mono text-[11px] truncate tabular-nums">
+                {g?.dailyLossCap.detail ?? `Max -₹${dailyMaxLoss}`}
+              </div>
+            </div>
+            <span
+              className={`shrink-0 rounded border px-2 py-0.5 font-mono text-[10px] font-semibold ${statusBadgeStyle(
+                g?.dailyLossCap.status ?? 'ACTIVE'
+              )}`}
+            >
+              {g?.dailyLossCap.status ?? 'ACTIVE'}
+            </span>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="text-[11px] text-slate-500">Max Open Positions</div>
+              <div className="font-mono text-[11px] truncate tabular-nums">
+                {g?.maxOpenPositions.detail ?? `${portfolio?.openPositions.length ?? 0}/${maxOpenPos}`}
+              </div>
+            </div>
+            <span
+              className={`shrink-0 rounded border px-2 py-0.5 font-mono text-[10px] font-semibold ${statusBadgeStyle(
+                g?.maxOpenPositions.status ?? 'ACTIVE'
+              )}`}
+            >
+              {g?.maxOpenPositions.status ?? 'ACTIVE'}
+            </span>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="text-[11px] text-slate-500">ADX Regime Filter</div>
+              <div className="font-mono text-[11px] truncate tabular-nums">
+                {g?.adxRegimeFilter.detail ?? 'ADX(14) ≥ 18'}
+              </div>
+            </div>
+            <span
+              className={`shrink-0 rounded border px-2 py-0.5 font-mono text-[10px] font-semibold ${statusBadgeStyle(
+                g?.adxRegimeFilter.status ?? 'ACTIVE'
+              )}`}
+            >
+              {g?.adxRegimeFilter.status ?? 'ACTIVE'}
+            </span>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 dark:border-slate-800 px-3 py-2 flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="text-[11px] text-slate-500">Loss Cooldown</div>
+              <div className="font-mono text-[11px] truncate tabular-nums">
+                {g?.consecutiveLossCooldown.detail ?? 'Clear'}
+              </div>
+            </div>
+            <span
+              className={`shrink-0 rounded border px-2 py-0.5 font-mono text-[10px] font-semibold ${statusBadgeStyle(
+                g?.consecutiveLossCooldown.status ?? 'ACTIVE'
+              )}`}
+            >
+              {g?.consecutiveLossCooldown.status ?? 'ACTIVE'}
+            </span>
+          </div>
         </div>
       </div>
 
@@ -295,10 +483,10 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
           </div>
         </div>
         <div className="rounded-xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-4">
-          <div className="text-xs text-slate-500">Risk Guardrails</div>
+          <div className="text-xs text-slate-500">Risk Budget ({riskPerTradePct.toFixed(1)}%)</div>
           <div className="mt-1 font-mono text-xs font-medium tabular-nums text-slate-700 dark:text-slate-300">
-            <div>Pos: {portfolio?.openPositions.length ?? 0}/{maxOpenPos}</div>
-            <div>Max Loss: -₹{dailyMaxLoss.toLocaleString('en-IN')}</div>
+            <div>Max Loss/Trade: ₹{maxRiskBudget.toFixed(0)}</div>
+            <div>Kill-Switch: -₹{dailyMaxLoss.toLocaleString('en-IN')}</div>
           </div>
         </div>
       </div>
@@ -319,6 +507,12 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
               Spot {portfolio?.markPrice.toFixed(2) ?? '—'}
             </span>
           </div>
+
+          {isKillSwitchActive && (
+            <div className="p-2.5 rounded-lg border border-red-500/40 bg-red-500/10 text-xs text-red-500">
+              {g?.dailyLossCap.detail}
+            </div>
+          )}
 
           {/* Instrument Mode Toggle: Options (CE/PE) vs Spot Index */}
           <div className="grid grid-cols-2 gap-1.5 p-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
@@ -480,6 +674,24 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
             </div>
           </div>
 
+          {/* Volatility Position Sizing Quick Helper */}
+          <div className="p-2.5 rounded-lg border border-sky-500/25 bg-sky-500/5 flex items-center justify-between gap-2 text-[11px]">
+            <div className="font-mono tabular-nums text-slate-600 dark:text-slate-300">
+              Vol Sizing ({riskPerTradePct.toFixed(1)}% = ₹{maxRiskBudget.toFixed(0)}):{' '}
+              <strong className="text-sky-500">
+                {volatilitySizedLots} {volatilitySizedLots === 1 ? 'lot' : 'lots'}
+              </strong>{' '}
+              (₹{(volatilitySizedLots * riskPerSingleLot).toFixed(0)} SL risk)
+            </div>
+            <button
+              type="button"
+              onClick={applyVolatilitySizing}
+              className="shrink-0 px-2 py-1 rounded border border-sky-500/40 text-sky-500 hover:bg-sky-500/10 font-sans font-semibold"
+            >
+              Apply
+            </button>
+          </div>
+
           <div className="text-xs">
             <label className="block text-slate-500 mb-1">Trade Notes (Optional)</label>
             <input
@@ -521,12 +733,14 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
 
           <button
             type="submit"
-            disabled={submitting}
-            className={`w-full py-2.5 px-4 rounded-lg text-white text-xs font-semibold transition-colors ${
+            disabled={submitting || isKillSwitchActive}
+            className={`w-full py-2.5 px-4 rounded-lg text-white text-xs font-semibold transition-colors disabled:opacity-50 ${
               side === 'BUY' ? 'bg-emerald-600 hover:bg-emerald-500' : 'bg-red-600 hover:bg-red-500'
             }`}
           >
-            {submitting
+            {isKillSwitchActive
+              ? 'Orders Halted (Daily Max Loss Kill-Switch)'
+              : submitting
               ? 'Placing Simulated Order...'
               : instrumentType === 'OPTION'
               ? `Place Simulated ${side} ${strike} ${optionType}`
@@ -708,6 +922,7 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
                       <th className="py-2.5 px-4 text-right font-sans">Entry</th>
                       <th className="py-2.5 px-4 text-right font-sans">Exit</th>
                       <th className="py-2.5 px-4 text-right font-sans">Realized P&amp;L</th>
+                      <th className="py-2.5 px-4 font-sans">Exit Reason</th>
                       <th className="py-2.5 px-4 font-sans">Closed At</th>
                     </tr>
                   </thead>
@@ -733,6 +948,9 @@ export const PaperTradingPage: React.FC<PaperTradingPageProps> = ({
                           }`}
                         >
                           {ord.realized_pnl >= 0 ? '+' : ''}₹{ord.realized_pnl.toFixed(2)}
+                        </td>
+                        <td className="py-2.5 px-4 font-sans text-slate-500">
+                          {ord.exit_reason ?? 'Manual Close'}
                         </td>
                         <td className="py-2.5 px-4 text-slate-500">
                           {ord.closed_at ? new Date(ord.closed_at).toLocaleString() : '—'}

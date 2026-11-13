@@ -10,6 +10,7 @@ import {
   OptionsChainResponse,
   PaperOrderRecord,
   PaperPortfolioResponse,
+  RiskTelemetry,
   TradingSignalRecord,
 } from '../types/trading';
 
@@ -131,7 +132,13 @@ export const api = {
 
   getModelStatus: () => request<ModelStatusResponse>('/api/model/status'),
 
-  trainModel: (params?: { nEstimators?: number; maxDepth?: number; minSamplesSplit?: number }) =>
+  trainModel: (params?: {
+    nEstimators?: number;
+    maxDepth?: number;
+    minSamplesSplit?: number;
+    minConfidenceThreshold?: number;
+    walkForward?: boolean;
+  }) =>
     request<ModelStatusResponse>('/api/model/train', {
       method: 'POST',
       body: JSON.stringify(params ?? {}),
@@ -176,6 +183,12 @@ export const api = {
     targetPct: number;
     chargeBps: number;
     slippageBps: number;
+    useAtrDynamic?: boolean;
+    atrStopMult?: number;
+    atrTargetMult?: number;
+    useAdxFilter?: boolean;
+    adxMinThreshold?: number;
+    useConsecutiveLossCooldown?: boolean;
   }) =>
     request<BacktestRunResult>('/api/backtest/run', {
       method: 'POST',
@@ -183,6 +196,14 @@ export const api = {
     }),
 
   getBacktestResults: () => request<{ results: BacktestRunResult[] }>('/api/backtest/results'),
+
+  getRiskStatus: () =>
+    request<{ riskTelemetry: RiskTelemetry; tradingSettings: AppSettings['trading'] }>('/api/risk/status'),
+
+  resetRiskCooldown: () =>
+    request<{ success: boolean; riskTelemetry: RiskTelemetry }>('/api/risk/reset-cooldown', {
+      method: 'POST',
+    }),
 
   getPortfolio: () => request<PaperPortfolioResponse>('/api/portfolio'),
 

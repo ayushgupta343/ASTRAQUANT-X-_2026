@@ -18,6 +18,7 @@ import {
 } from './server/quant.ts';
 import {
   RandomForestArtifact,
+  clampConfidenceThreshold,
   extractFeatureVector,
   generateSignalForCandle,
   predictWithForest,
@@ -97,6 +98,9 @@ function getLatestTrainedModel(datasetId?: number) {
         feature_importance_json: string;
         prediction_history_json: string;
         model_artifact_json: string;
+        min_confidence_threshold?: number | null;
+        high_conviction_json?: string | null;
+        walk_forward_json?: string | null;
         created_at: string;
       }
     | undefined;
@@ -391,13 +395,21 @@ function buildOverviewFromContext(ctx: ActiveMarketContext) {
 
   if (modelRow) {
     const artifact = JSON.parse(modelRow.model_artifact_json) as RandomForestArtifact;
-    const generated = generateSignalForCandle(artifact, latest);
+    const minConf = clampConfidenceThreshold(
+      modelRow.min_confidence_threshold ?? appSettings.ml.minConfidenceThreshold
+    );
+    const generated = generateSignalForCandle(artifact, latest, minConf);
     if (generated) {
       const optionRec = mapSignalToOptionContract({
         signal: generated.signal_type,
         spot: ctx.spotPrice,
         dateStr: latest.date_str,
         rollingVolPct: latest.volatility,
+        atr: appSettings.trading.stopLossMode === 'atr_dynamic' ? latest.atr : null,
+        stopAtrMult: appSettings.trading.atrStopMult,
+        targetAtrMult: appSettings.trading.atrTargetMult,
+        capital: 100000,
+        riskPerTradePct: appSettings.trading.riskPerTradePct,
         uploadedRows: uploadedOptionRows,
         preferredMode: preferredOptMode,
       });
@@ -406,6 +418,9 @@ function buildOverviewFromContext(ctx: ActiveMarketContext) {
         modelId: modelRow.id,
         algorithm: modelRow.algorithm,
         signal: generated.signal_type,
+        rawSignal: generated.raw_signal_type,
+        thresholdGated: generated.threshold_gated,
+        minConfidenceThreshold: minConf,
         confidence: generated.confidence,
         predictedMovePct: generated.predicted_move_pct,
         recommendation: {
@@ -448,6 +463,12 @@ function buildOverviewFromContext(ctx: ActiveMarketContext) {
       ema20: latest.ema20,
       sma50: latest.sma50,
       volatility: latest.volatility,
+      vwap: latest.vwap,
+      vwapDistance: latest.vwapDistance,
+      atr: latest.atr,
+      adx: latest.adx,
+      htfEma20Slope: latest.htfEma20Slope,
+      htfRsi14: latest.htfRsi14,
       trendDirection,
     },
     prediction,
@@ -675,9 +696,15 @@ app.get('/api/data/export', (req, res) => {
 // ============================================================================
 app.get('/api/model/status', (_req, res) => {
   try {
+    const appSettings = getAppSettingsObject();
     const active = getActiveDataset();
     if (!active) {
-      return res.json({ status: 'Not trained', reason: 'No active dataset loaded.' });
+      return res.json({
+        status: 'Not trained',
+        reason: 'No active dataset loaded.',
+        minConfidenceThreshold: appSettings.ml.minConfidenceThreshold,
+        walkForwardEnabled: appSettings.ml.walkForwardEnabled,
+      });
     }
 
     const modelRow = getLatestTrainedModel(active.id);
@@ -688,8 +715,14 @@ app.get('/api/model/status', (_req, res) => {
         datasetName: active.name,
         datasetSize: active.record_count,
         dateRange: `${active.start_date} to ${active.end_date}`,
+        minConfidenceThreshold: appSettings.ml.minConfidenceThreshold,
+        walkForwardEnabled: appSettings.ml.walkForwardEnabled,
       });
     }
+
+    const minConfidenceThreshold = clampConfidenceThreshold(
+      modelRow.min_confidence_threshold ?? appSettings.ml.minConfidenceThreshold
+    );
 
     res.json({
       status: 'Trained',
@@ -703,6 +736,8 @@ app.get('/api/model/status', (_req, res) => {
       valSize: modelRow.val_size,
       testSize: modelRow.test_size,
       dateRange: modelRow.date_range,
+      minConfidenceThreshold,
+      walkForwardEnabled: Boolean(modelRow.walk_forward_json),
       metrics: {
         accuracy: modelRow.accuracy,
         balancedAccuracy: modelRow.balanced_accuracy,
@@ -710,6 +745,8 @@ app.get('/api/model/status', (_req, res) => {
         recall: modelRow.recall_macro,
         f1Score: modelRow.f1_macro,
       },
+      highConviction: modelRow.high_conviction_json ? JSON.parse(modelRow.high_conviction_json) : null,
+      walkForward: modelRow.walk_forward_json ? JSON.parse(modelRow.walk_forward_json) : null,
       confusionMatrix: JSON.parse(modelRow.confusion_matrix_json),
       classDistribution: JSON.parse(modelRow.class_distribution_json),
       featureImportance: JSON.parse(modelRow.feature_importance_json),
@@ -744,19 +781,39 @@ app.post('/api/model/train', async (req, res) => {
         }))
       : getCandlesForDataset(active!.id);
 
-    const nEstimators = Math.min(80, Math.max(10, Number(req.body?.nEstimators ?? 30)));
-    const maxDepth = Math.min(10, Math.max(3, Number(req.body?.maxDepth ?? 6)));
-    const minSamplesSplit = Math.min(25, Math.max(4, Number(req.body?.minSamplesSplit ?? 8)));
+    const appSettings = getAppSettingsObject();
+    const nEstimators = Math.min(80, Math.max(10, Number(req.body?.nEstimators ?? appSettings.ml.nEstimators ?? 30)));
+    const maxDepth = Math.min(10, Math.max(3, Number(req.body?.maxDepth ?? appSettings.ml.maxDepth ?? 6)));
+    const minSamplesSplit = Math.min(
+      25,
+      Math.max(4, Number(req.body?.minSamplesSplit ?? appSettings.ml.minSamplesSplit ?? 8))
+    );
+    const minConfidenceThreshold = clampConfidenceThreshold(
+      req.body?.minConfidenceThreshold ?? appSettings.ml.minConfidenceThreshold ?? 0.65
+    );
+    const walkForward = Boolean(req.body?.walkForward ?? appSettings.ml.walkForwardEnabled ?? false);
+
+    // Persist active ML hyperparameters & conviction threshold in settings
+    const now = new Date().toISOString();
+    appSettings.ml.nEstimators = nEstimators;
+    appSettings.ml.maxDepth = maxDepth;
+    appSettings.ml.minSamplesSplit = minSamplesSplit;
+    appSettings.ml.minConfidenceThreshold = minConfidenceThreshold;
+    appSettings.ml.walkForwardEnabled = walkForward;
+    db.prepare('UPDATE app_settings SET settings_json = ?, updated_at = ? WHERE id = 1').run(
+      JSON.stringify(appSettings),
+      now
+    );
 
     const evaluation = trainRandomForestPipeline(raw, {
       nEstimators,
       maxDepth,
       minSamplesSplit,
       horizonCandles: 3,
-      thresholdPct: 0.001,
+      minConfidenceThreshold,
+      walkForward,
     });
 
-    const now = new Date().toISOString();
     const datasetIdForModel = active?.id ?? ctx.datasetId ?? 1;
     const insertModel = db.prepare(
       `INSERT INTO ml_models (
@@ -764,8 +821,9 @@ app.post('/api/model/train', async (req, res) => {
         train_size, val_size, test_size, date_range,
         accuracy, balanced_accuracy, precision_macro, recall_macro, f1_macro,
         confusion_matrix_json, class_distribution_json, feature_importance_json,
-        prediction_history_json, model_artifact_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        prediction_history_json, model_artifact_json,
+        min_confidence_threshold, high_conviction_json, walk_forward_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
 
     const modelRes = insertModel.run(
@@ -788,6 +846,9 @@ app.post('/api/model/train', async (req, res) => {
       JSON.stringify(evaluation.featureImportance),
       JSON.stringify(evaluation.predictionHistory),
       JSON.stringify(evaluation.artifact),
+      minConfidenceThreshold,
+      JSON.stringify(evaluation.highConviction),
+      evaluation.walkForward ? JSON.stringify(evaluation.walkForward) : null,
       now
     );
 
@@ -802,7 +863,6 @@ app.post('/api/model/train', async (req, res) => {
       ? 'Sample Historical'
       : 'Uploaded Historical CSV';
 
-    const appSettings = getAppSettingsObject();
     const activeOptUpload = getActiveOptionsUpload();
     const uploadedOptionRows = activeOptUpload
       ? (JSON.parse(activeOptUpload.rows_json) as UploadedOptionRow[])
@@ -823,13 +883,18 @@ app.post('/api/model/train', async (req, res) => {
     );
 
     for (const c of tailCandles) {
-      const sig = generateSignalForCandle(evaluation.artifact, c);
+      const sig = generateSignalForCandle(evaluation.artifact, c, minConfidenceThreshold);
       if (sig) {
         const opt = mapSignalToOptionContract({
           signal: sig.signal_type,
           spot: sig.market_price,
           dateStr: sig.date_str,
           rollingVolPct: c.volatility,
+          atr: appSettings.trading.stopLossMode === 'atr_dynamic' ? c.atr : null,
+          stopAtrMult: appSettings.trading.atrStopMult,
+          targetAtrMult: appSettings.trading.atrTargetMult,
+          capital: 100000,
+          riskPerTradePct: appSettings.trading.riskPerTradePct,
           uploadedRows: uploadedOptionRows,
           preferredMode: preferredOptMode,
         });
@@ -870,7 +935,7 @@ app.post('/api/model/train', async (req, res) => {
     // If Auto-Execute Signals (Simulated) is enabled, execute on latest BUY/SELL signal automatically
     let autoExecResult: unknown = null;
     if (appSettings.trading.autoExecuteSignals) {
-      autoExecResult = tryAutoExecuteLatestSignal();
+      autoExecResult = await tryAutoExecuteLatestSignal();
     }
 
     res.json({
@@ -885,6 +950,8 @@ app.post('/api/model/train', async (req, res) => {
       valSize: evaluation.valSize,
       testSize: evaluation.testSize,
       dateRange: evaluation.dateRange,
+      minConfidenceThreshold,
+      walkForwardEnabled: walkForward,
       metrics: {
         accuracy: evaluation.accuracy,
         balancedAccuracy: evaluation.balancedAccuracy,
@@ -892,6 +959,8 @@ app.post('/api/model/train', async (req, res) => {
         recall: evaluation.recallMacro,
         f1Score: evaluation.f1Macro,
       },
+      highConviction: evaluation.highConviction,
+      walkForward: evaluation.walkForward,
       confusionMatrix: evaluation.confusionMatrix,
       classDistribution: evaluation.classDistribution,
       featureImportance: evaluation.featureImportance,
@@ -915,6 +984,10 @@ app.post('/api/model/predict', (req, res) => {
       return res.status(400).json({ error: 'Model is not trained yet. Train the Random Forest model first.' });
     }
 
+    const appSettings = getAppSettingsObject();
+    const minConfidenceThreshold = clampConfidenceThreshold(
+      req.body?.minConfidenceThreshold ?? modelRow.min_confidence_threshold ?? appSettings.ml.minConfidenceThreshold
+    );
     const artifact = JSON.parse(modelRow.model_artifact_json) as RandomForestArtifact;
     const raw = getCandlesForDataset(active.id);
     const enriched = calculateIndicators(raw);
@@ -929,11 +1002,12 @@ app.post('/api/model/predict', (req, res) => {
       return res.status(400).json({ error: 'Selected candle lacks sufficient indicator warm-up history.' });
     }
 
-    const pred = predictWithForest(artifact, vec);
-    const signal = generateSignalForCandle(artifact, targetCandle);
+    const pred = predictWithForest(artifact, vec, minConfidenceThreshold);
+    const signal = generateSignalForCandle(artifact, targetCandle, minConfidenceThreshold);
 
     res.json({
       modelId: modelRow.id,
+      minConfidenceThreshold,
       candle: {
         date_str: targetCandle.date_str,
         time_str: targetCandle.time_str,
@@ -981,6 +1055,7 @@ app.post('/api/backtest/run', (req, res) => {
       return res.status(400).json({ error: 'No active dataset loaded.' });
     }
 
+    const appSettings = getAppSettingsObject();
     const strategy = (req.body?.strategy || 'rsi_macd_confluence') as BacktestStrategy;
     const startDate = req.body?.startDate || undefined;
     const endDate = req.body?.endDate || undefined;
@@ -990,6 +1065,25 @@ app.post('/api/backtest/run', (req, res) => {
     const targetPct = Math.max(0.05, Number(req.body?.targetPct ?? 0.7));
     const chargeBps = Math.max(0, Number(req.body?.chargeBps ?? 3));
     const slippageBps = Math.max(0, Number(req.body?.slippageBps ?? 2));
+    const useAtrDynamic =
+      req.body?.useAtrDynamic !== undefined
+        ? Boolean(req.body.useAtrDynamic)
+        : appSettings.trading.stopLossMode === 'atr_dynamic';
+    const atrStopMult = Number(req.body?.atrStopMult ?? appSettings.trading.atrStopMult ?? 1.2);
+    const atrTargetMult = Number(req.body?.atrTargetMult ?? appSettings.trading.atrTargetMult ?? 2.4);
+    const useAdxFilter =
+      req.body?.useAdxFilter !== undefined
+        ? Boolean(req.body.useAdxFilter)
+        : appSettings.trading.adxChopFilterEnabled;
+    const adxMinThreshold = Number(req.body?.adxMinThreshold ?? appSettings.trading.adxMinThreshold ?? 18);
+    const useConsecutiveLossCooldown =
+      req.body?.useConsecutiveLossCooldown !== undefined
+        ? Boolean(req.body.useConsecutiveLossCooldown)
+        : appSettings.trading.consecutiveLossCooldownEnabled;
+    const consecutiveLossLimit = Number(
+      req.body?.consecutiveLossLimit ?? appSettings.trading.consecutiveLossLimit ?? 2
+    );
+    const cooldownCandles = Number(req.body?.cooldownCandles ?? appSettings.trading.cooldownCandles ?? 6);
 
     const modelRow = getLatestTrainedModel(active.id);
     const artifact = modelRow ? (JSON.parse(modelRow.model_artifact_json) as RandomForestArtifact) : null;
@@ -1010,6 +1104,14 @@ app.post('/api/backtest/run', (req, res) => {
         targetPct,
         chargeBps,
         slippageBps,
+        useAtrDynamic,
+        atrStopMult,
+        atrTargetMult,
+        useAdxFilter,
+        adxMinThreshold,
+        useConsecutiveLossCooldown,
+        consecutiveLossLimit,
+        cooldownCandles,
       },
       artifact,
       minMlTimestamp
@@ -1019,17 +1121,28 @@ app.post('/api/backtest/run', (req, res) => {
     const saved = db
       .prepare(
         `INSERT INTO backtests (
-          dataset_id, strategy, date_range, config_json, metrics_json, equity_curve_json, trades_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          dataset_id, strategy, date_range, config_json, metrics_json, equity_curve_json, trades_json, comparison_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         active.id,
         strategy,
         result.dateRange,
-        JSON.stringify({ initialCapital, positionSize, stopLossPct, targetPct, chargeBps, slippageBps }),
+        JSON.stringify({
+          initialCapital,
+          positionSize,
+          stopLossPct,
+          targetPct,
+          chargeBps,
+          slippageBps,
+          useAtrDynamic,
+          useAdxFilter,
+          useConsecutiveLossCooldown,
+        }),
         JSON.stringify(result.metrics),
         JSON.stringify(result.equityCurve),
         JSON.stringify(result.trades),
+        JSON.stringify(result.baselineComparison),
         now
       );
 
@@ -1054,6 +1167,7 @@ app.get('/api/backtest/results', (_req, res) => {
       metrics_json: string;
       equity_curve_json: string;
       trades_json: string;
+      comparison_json?: string | null;
       created_at: string;
     }>;
 
@@ -1066,6 +1180,7 @@ app.get('/api/backtest/results', (_req, res) => {
       metrics: JSON.parse(r.metrics_json),
       equityCurve: JSON.parse(r.equity_curve_json),
       trades: JSON.parse(r.trades_json),
+      baselineComparison: r.comparison_json ? JSON.parse(r.comparison_json) : null,
       createdAt: r.created_at,
     }));
 
@@ -1208,6 +1323,309 @@ function getOptionMarkPremium(params: {
   return greeks.ltp;
 }
 
+function getRiskStateRow() {
+  return db.prepare('SELECT * FROM risk_state WHERE id = 1').get() as
+    | {
+        id: number;
+        cooldown_triggered_candle_ts: number | null;
+        cooldown_triggered_wall_ms: number | null;
+        cooldown_reason: string | null;
+        last_reset_at: string;
+      }
+    | undefined;
+}
+
+function getConsecutiveLossStreakSinceReset(lastResetAt: string): number {
+  const closed = db
+    .prepare(
+      "SELECT realized_pnl, closed_at FROM paper_orders WHERE status = 'CLOSED' AND COALESCE(closed_at, '') > ? ORDER BY closed_at DESC, id DESC LIMIT 20"
+    )
+    .all(lastResetAt || '') as Array<{ realized_pnl: number; closed_at: string }>;
+
+  let streak = 0;
+  for (const row of closed) {
+    if (row.realized_pnl < 0) {
+      streak++;
+    } else {
+      break;
+    }
+  }
+  return streak;
+}
+
+function syncCooldownAfterOrderClose(latestCandleTs: number | null) {
+  const settings = getAppSettingsObject();
+  if (!settings.trading.consecutiveLossCooldownEnabled) return;
+  const riskState = getRiskStateRow();
+  const streak = getConsecutiveLossStreakSinceReset(riskState?.last_reset_at ?? '');
+  const limit = Math.max(1, Number(settings.trading.consecutiveLossLimit ?? 2));
+  if (streak >= limit && !riskState?.cooldown_triggered_candle_ts) {
+    db.prepare(
+      'UPDATE risk_state SET cooldown_triggered_candle_ts = ?, cooldown_triggered_wall_ms = ?, cooldown_reason = ? WHERE id = 1'
+    ).run(latestCandleTs ?? Math.floor(Date.now() / 1000), Date.now(), `${streak} consecutive losing trades`);
+  }
+}
+
+function resetRiskCooldownState() {
+  const now = new Date().toISOString();
+  db.prepare(
+    'UPDATE risk_state SET cooldown_triggered_candle_ts = NULL, cooldown_triggered_wall_ms = NULL, cooldown_reason = NULL, last_reset_at = ? WHERE id = 1'
+  ).run(now);
+}
+
+function processOpenPositionExits(ctx: ActiveMarketContext) {
+  const settings = getAppSettingsObject();
+  const latest = ctx.candles[ctx.candles.length - 1];
+  if (!latest) return [];
+
+  const openOrders = db
+    .prepare("SELECT * FROM paper_orders WHERE status = 'OPEN' ORDER BY id ASC")
+    .all() as Array<{
+    id: number;
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    quantity: number;
+    entry_price: number;
+    stop_loss: number;
+    target_price: number;
+    instrument_type: string | null;
+    option_strike: number | null;
+    option_type: 'CE' | 'PE' | null;
+    opened_candle_ts: number | null;
+  }>;
+
+  const autoClosed: Array<{ orderId: number; symbol: string; reason: string; realizedPnl: number }> = [];
+
+  for (const pos of openOrders) {
+    const isOption = pos.instrument_type === 'OPTION' && pos.option_strike && pos.option_type;
+    const markPrice = isOption
+      ? getOptionMarkPremium({
+          strike: pos.option_strike!,
+          optionType: pos.option_type!,
+          spot: ctx.spotPrice,
+          rollingVolPct: latest.volatility,
+          dateStr: ctx.dateStr,
+        })
+      : ctx.spotPrice;
+
+    let exitReason: string | null = null;
+
+    // 1. Stop-Loss & Target check during live / replay streaming
+    if (ctx.feedMode !== 'historical_csv' && pos.opened_candle_ts !== latest.timestamp) {
+      if (pos.side === 'BUY') {
+        if (markPrice <= pos.stop_loss) exitReason = 'Stop-Loss Hit';
+        else if (markPrice >= pos.target_price) exitReason = 'Target Hit';
+      } else {
+        if (markPrice >= pos.stop_loss) exitReason = 'Stop-Loss Hit';
+        else if (markPrice <= pos.target_price) exitReason = 'Target Hit';
+      }
+    }
+
+    // 2. Time-Based Option Exit after N candles (default 6 candles = 30 mins) to prevent Theta decay bleed
+    if (
+      !exitReason &&
+      isOption &&
+      settings.trading.timeBasedOptionExitEnabled &&
+      pos.opened_candle_ts
+    ) {
+      const maxHoldCandles = Math.max(1, Number(settings.trading.optionMaxHoldCandles ?? 6));
+      const candlesHeld = ctx.candles.filter((c) => c.timestamp > pos.opened_candle_ts!).length;
+      if (candlesHeld >= maxHoldCandles) {
+        exitReason = `Time-Based Option Exit (${candlesHeld} candles / Theta Guard)`;
+      }
+    }
+
+    if (exitReason) {
+      const pnl =
+        pos.side === 'BUY'
+          ? (markPrice - pos.entry_price) * pos.quantity
+          : (pos.entry_price - markPrice) * pos.quantity;
+      const roundedPnl = Number(pnl.toFixed(2));
+      const now = new Date().toISOString();
+
+      db.exec('BEGIN');
+      try {
+        db.prepare(
+          "UPDATE paper_orders SET status = 'CLOSED', exit_price = ?, realized_pnl = ?, exit_reason = ?, closed_at = ? WHERE id = ?"
+        ).run(Number(markPrice.toFixed(2)), roundedPnl, exitReason, now, pos.id);
+
+        db.prepare(
+          'UPDATE paper_portfolio SET cash_balance = cash_balance + ?, realized_pnl = realized_pnl + ?, updated_at = ? WHERE id = 1'
+        ).run(roundedPnl, roundedPnl, now);
+        db.exec('COMMIT');
+      } catch (e) {
+        db.exec('ROLLBACK');
+        throw e;
+      }
+
+      syncCooldownAfterOrderClose(latest.timestamp);
+      autoClosed.push({ orderId: pos.id, symbol: pos.symbol, reason: exitReason, realizedPnl: roundedPnl });
+    }
+  }
+
+  return autoClosed;
+}
+
+type GuardrailLevel = 'ACTIVE' | 'WARNING' | 'TRIGGERED';
+
+function computeRiskTelemetry(
+  ctx: ActiveMarketContext,
+  portfolio: ReturnType<typeof computePortfolioSnapshot>
+) {
+  const settings = getAppSettingsObject();
+  const latest = ctx.candles[ctx.candles.length - 1] ?? null;
+
+  // 1. Daily Max Loss Kill-Switch
+  const dailyMaxLossLimit = Math.max(100, Math.abs(Number(settings.trading.dailyMaxLoss ?? 3000)));
+  const lossUsed = Math.max(0, -portfolio.dailyNetPnl);
+  const lossPctUsed = Number(Math.min(100, (lossUsed / dailyMaxLossLimit) * 100).toFixed(1));
+  const dailyLossStatus: GuardrailLevel =
+    portfolio.dailyNetPnl <= -dailyMaxLossLimit
+      ? 'TRIGGERED'
+      : lossUsed >= dailyMaxLossLimit * 0.75
+      ? 'WARNING'
+      : 'ACTIVE';
+
+  // 2. Max Open Positions
+  const maxPosLimit = Math.max(1, Number(settings.trading.maxOpenPositions ?? 3));
+  const openCount = portfolio.openPositions.length;
+  const maxPosStatus: GuardrailLevel =
+    openCount >= maxPosLimit
+      ? 'TRIGGERED'
+      : maxPosLimit >= 2 && openCount >= maxPosLimit - 1
+      ? 'WARNING'
+      : 'ACTIVE';
+
+  // 3. ADX Chop Filter
+  const adxEnabled = Boolean(settings.trading.adxChopFilterEnabled ?? true);
+  const adxMin = Number(settings.trading.adxMinThreshold ?? 18);
+  const currentAdx = latest?.adx ?? null;
+  let adxStatus: GuardrailLevel = 'ACTIVE';
+  if (adxEnabled && currentAdx !== null) {
+    if (currentAdx < adxMin) adxStatus = 'TRIGGERED';
+    else if (currentAdx < adxMin + 3) adxStatus = 'WARNING';
+  }
+
+  // 4. Consecutive-Loss Cooldown (6 candles / 30 mins after 2 consecutive losses)
+  const cooldownEnabled = Boolean(settings.trading.consecutiveLossCooldownEnabled ?? true);
+  const lossLimit = Math.max(1, Number(settings.trading.consecutiveLossLimit ?? 2));
+  const cooldownCandles = Math.max(1, Number(settings.trading.cooldownCandles ?? 6));
+  const riskState = getRiskStateRow();
+  const streak = getConsecutiveLossStreakSinceReset(riskState?.last_reset_at ?? '');
+  let candlesRemaining = 0;
+
+  if (cooldownEnabled && riskState?.cooldown_triggered_candle_ts) {
+    const candlesAfterTrigger = ctx.candles.filter(
+      (c) => c.timestamp > riskState.cooldown_triggered_candle_ts!
+    ).length;
+    const wallMinsElapsed = riskState.cooldown_triggered_wall_ms
+      ? (Date.now() - riskState.cooldown_triggered_wall_ms) / 60000
+      : 0;
+    const effectiveElapsed = Math.max(
+      candlesAfterTrigger,
+      ctx.feedMode === 'free_live_nse' ? Math.floor(wallMinsElapsed / 5) : 0
+    );
+    candlesRemaining = Math.max(0, cooldownCandles - effectiveElapsed);
+    if (candlesRemaining === 0) {
+      resetRiskCooldownState();
+    }
+  } else if (cooldownEnabled && streak >= lossLimit && latest) {
+    db.prepare(
+      'UPDATE risk_state SET cooldown_triggered_candle_ts = ?, cooldown_triggered_wall_ms = ?, cooldown_reason = ? WHERE id = 1'
+    ).run(latest.timestamp, Date.now(), `${streak} consecutive losing trades`);
+    candlesRemaining = cooldownCandles;
+  }
+
+  const cooldownStatus: GuardrailLevel = !cooldownEnabled
+    ? 'ACTIVE'
+    : candlesRemaining > 0
+    ? 'TRIGGERED'
+    : streak >= Math.max(1, lossLimit - 1)
+    ? 'WARNING'
+    : 'ACTIVE';
+
+  // 5. Time-Based Option Exit telemetry
+  const maxHoldCandles = Math.max(1, Number(settings.trading.optionMaxHoldCandles ?? 6));
+  const openOptions = portfolio.openPositions.filter((p) => p.instrument_type === 'OPTION');
+  let maxCandlesHeld = 0;
+  for (const pos of openOptions) {
+    if (pos.opened_candle_ts) {
+      const held = ctx.candles.filter((c) => c.timestamp > pos.opened_candle_ts!).length;
+      if (held > maxCandlesHeld) maxCandlesHeld = held;
+    }
+  }
+
+  const statuses: GuardrailLevel[] = [dailyLossStatus, maxPosStatus, adxStatus, cooldownStatus];
+  const overallStatus: GuardrailLevel = statuses.includes('TRIGGERED')
+    ? 'TRIGGERED'
+    : statuses.includes('WARNING')
+    ? 'WARNING'
+    : 'ACTIVE';
+
+  return {
+    overallStatus,
+    canPlaceManualOrder: dailyLossStatus !== 'TRIGGERED' && maxPosStatus !== 'TRIGGERED',
+    canAutoExecute:
+      dailyLossStatus !== 'TRIGGERED' &&
+      maxPosStatus !== 'TRIGGERED' &&
+      adxStatus !== 'TRIGGERED' &&
+      cooldownStatus !== 'TRIGGERED',
+    latestSpot: ctx.spotPrice,
+    latestAtr: latest?.atr ?? null,
+    latestAdx: currentAdx,
+    guardrails: {
+      dailyLossCap: {
+        status: dailyLossStatus,
+        dailyNetPnl: portfolio.dailyNetPnl,
+        limit: dailyMaxLossLimit,
+        pctUsed: lossPctUsed,
+        detail:
+          dailyLossStatus === 'TRIGGERED'
+            ? `Kill-Switch Halted: Daily Net P&L ₹${portfolio.dailyNetPnl.toFixed(0)} hit -₹${dailyMaxLossLimit}`
+            : `Daily Net P&L ₹${portfolio.dailyNetPnl.toFixed(0)} / -₹${dailyMaxLossLimit} cap`,
+      },
+      maxOpenPositions: {
+        status: maxPosStatus,
+        openCount,
+        limit: maxPosLimit,
+        detail: `${openCount}/${maxPosLimit} active positions`,
+      },
+      adxRegimeFilter: {
+        status: adxStatus,
+        enabled: adxEnabled,
+        currentAdx,
+        minThreshold: adxMin,
+        detail: !adxEnabled
+          ? 'Filter Disabled'
+          : currentAdx === null
+          ? 'Warming up ADX(14)'
+          : currentAdx < adxMin
+          ? `Blocked: ADX(14) ${currentAdx.toFixed(1)} < ${adxMin} (Choppy Regime)`
+          : `Trending: ADX(14) ${currentAdx.toFixed(1)} ≥ ${adxMin}`,
+      },
+      consecutiveLossCooldown: {
+        status: cooldownStatus,
+        enabled: cooldownEnabled,
+        consecutiveLosses: streak,
+        lossLimit,
+        candlesRemaining,
+        cooldownCandles,
+        detail: !cooldownEnabled
+          ? 'Cooldown Disabled'
+          : candlesRemaining > 0
+          ? `Paused: ${candlesRemaining} candles (${candlesRemaining * 5}m) remaining after ${lossLimit} losses`
+          : `Loss Streak ${streak}/${lossLimit} · Clear`,
+      },
+      timeBasedOptionExit: {
+        enabled: Boolean(settings.trading.timeBasedOptionExitEnabled ?? true),
+        maxHoldCandles,
+        openOptionPositionsCount: openOptions.length,
+        maxCandlesHeld,
+      },
+    },
+  };
+}
+
 function computePortfolioSnapshot(markOverride?: {
   price: number;
   timestampLabel: string;
@@ -1238,6 +1656,7 @@ function computePortfolioSnapshot(markOverride?: {
     lots: number | null;
     is_auto_executed: number | null;
     rationale: string | null;
+    opened_candle_ts: number | null;
     opened_at: string;
     notes: string | null;
   }>;
@@ -1318,6 +1737,7 @@ function executeSimulatedOrder(params: {
   notes?: string;
   rationale?: string;
   isAutoExecuted?: boolean;
+  openedCandleTs?: number | null;
   markOverride?: {
     price: number;
     timestampLabel: string;
@@ -1374,11 +1794,11 @@ function executeSimulatedOrder(params: {
     ).toFixed(2)
   );
 
-  // Guardrail 1: Daily Max Loss check
-  const dailyMaxLoss = Number(settings.trading.dailyMaxLoss ?? 5000);
+  // Guardrail 1: Daily Max Loss Kill-Switch (halts ALL new orders)
+  const dailyMaxLoss = Number(settings.trading.dailyMaxLoss ?? 3000);
   if (snap.dailyNetPnl <= -Math.abs(dailyMaxLoss)) {
     throw new Error(
-      `BLOCKED (Daily Max Loss): Net P&L ₹${snap.dailyNetPnl.toFixed(0)} reached daily loss limit of -₹${dailyMaxLoss}.`
+      `BLOCKED (Daily Max Loss Kill-Switch): Net P&L ₹${snap.dailyNetPnl.toFixed(0)} hit daily loss limit of -₹${dailyMaxLoss}.`
     );
   }
 
@@ -1411,8 +1831,8 @@ function executeSimulatedOrder(params: {
       `INSERT INTO paper_orders (
         symbol, side, quantity, entry_price, stop_loss, target_price, status, realized_pnl,
         notes, instrument_type, option_strike, option_type, option_expiry, lot_size, lots,
-        is_auto_executed, rationale, opened_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        is_auto_executed, rationale, opened_candle_ts, opened_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       symbol,
@@ -1430,6 +1850,7 @@ function executeSimulatedOrder(params: {
       lots,
       params.isAutoExecuted ? 1 : 0,
       params.rationale ?? null,
+      params.openedCandleTs ?? null,
       now
     );
 
@@ -1454,8 +1875,37 @@ function executeSimulatedOrder(params: {
   };
 }
 
-function tryAutoExecuteLatestSignal() {
+function checkAutoExecutionGuardrails(
+  ctx: ActiveMarketContext,
+  portfolio: ReturnType<typeof computePortfolioSnapshot>
+): string | null {
+  const telemetry = computeRiskTelemetry(ctx, portfolio);
+  if (telemetry.guardrails.dailyLossCap.status === 'TRIGGERED') {
+    return telemetry.guardrails.dailyLossCap.detail;
+  }
+  if (telemetry.guardrails.adxRegimeFilter.status === 'TRIGGERED') {
+    return telemetry.guardrails.adxRegimeFilter.detail;
+  }
+  if (telemetry.guardrails.consecutiveLossCooldown.status === 'TRIGGERED') {
+    return telemetry.guardrails.consecutiveLossCooldown.detail;
+  }
+  if (telemetry.guardrails.maxOpenPositions.status === 'TRIGGERED') {
+    return `BLOCKED (Max Open Positions): ${telemetry.guardrails.maxOpenPositions.detail}`;
+  }
+  return null;
+}
+
+async function tryAutoExecuteLatestSignal() {
   const settings = getAppSettingsObject();
+  const ctx = await getActiveMarketContext();
+  const latestBar = ctx.candles[ctx.candles.length - 1] ?? null;
+  const markOverride = {
+    price: ctx.spotPrice,
+    timestampLabel: `${ctx.dateStr} ${ctx.timeStr} IST`,
+    rollingVolPct: latestBar?.volatility ?? null,
+    dateStr: ctx.dateStr,
+  };
+
   const latestSignal = db
     .prepare(
       "SELECT * FROM signals WHERE signal_type IN ('BUY', 'SELL') ORDER BY timestamp DESC LIMIT 1"
@@ -1495,15 +1945,30 @@ function tryAutoExecuteLatestSignal() {
   }
 
   const now = new Date().toISOString();
-  const lots = Math.max(1, Number(settings.trading.defaultLots ?? 1));
   const lotSize = latestSignal.option_lot_size ?? BANKNIFTY_LOT_SIZE;
+  const entryPrem = latestSignal.option_entry_premium ?? 250;
+  const slPrem = latestSignal.option_stop_loss ?? Number(Math.max(1, entryPrem * 0.8).toFixed(2));
+  const portfolio = computePortfolioSnapshot(markOverride);
+
+  // Volatility-adjusted lot sizing when ATR-Dynamic mode is enabled
+  let lots = Math.max(1, Number(settings.trading.defaultLots ?? 1));
+  if (settings.trading.stopLossMode === 'atr_dynamic') {
+    const slDist = Math.max(1, entryPrem - slPrem);
+    const maxRiskRupees = (portfolio.totalEquity * Number(settings.trading.riskPerTradePct ?? 1.0)) / 100;
+    lots = Math.max(1, Math.floor(maxRiskRupees / (slDist * lotSize)));
+  }
+
   const contractName =
     latestSignal.option_contract ??
     `BANKNIFTY ${latestSignal.option_expiry ?? getReferenceExpiry()} ${latestSignal.option_strike ?? ''} ${latestSignal.option_type ?? (latestSignal.signal_type === 'BUY' ? 'CE' : 'PE')}`;
-  const entryPrem = latestSignal.option_entry_premium ?? 250;
   const capReq = Number((entryPrem * lotSize * lots).toFixed(2));
 
   try {
+    const blockReason = checkAutoExecutionGuardrails(ctx, portfolio);
+    if (blockReason) {
+      throw new Error(blockReason);
+    }
+
     const order = executeSimulatedOrder({
       instrumentType: 'OPTION',
       side: 'BUY', // Directional option buyer: BUY CE on BUY signal, BUY PE on SELL signal
@@ -1513,11 +1978,13 @@ function tryAutoExecuteLatestSignal() {
       optionType: latestSignal.option_type ?? (latestSignal.signal_type === 'BUY' ? 'CE' : 'PE'),
       optionExpiry: latestSignal.option_expiry,
       entryPrice: entryPrem,
-      stopLoss: latestSignal.option_stop_loss ?? undefined,
+      stopLoss: slPrem,
       targetPrice: latestSignal.option_target ?? undefined,
       notes: `Auto-Executed on ${latestSignal.signal_type} signal (${latestSignal.date_str} ${latestSignal.time_str})`,
       rationale: latestSignal.reason,
       isAutoExecuted: true,
+      openedCandleTs: latestBar?.timestamp ?? latestSignal.timestamp,
+      markOverride,
     });
 
     db.prepare(
@@ -1534,7 +2001,7 @@ function tryAutoExecuteLatestSignal() {
       order.entryPrice,
       lots,
       order.capitalRequired,
-      `Passed: Capital ₹${order.capitalRequired.toLocaleString('en-IN')} · Within Daily Max Loss & Position Limits`,
+      `Passed: Capital ₹${order.capitalRequired.toLocaleString('en-IN')} · ADX/Cooldown/Loss Cap Clear`,
       latestSignal.reason,
       order.orderId,
       now
@@ -1565,18 +2032,61 @@ function tryAutoExecuteLatestSignal() {
   }
 }
 
+app.get('/api/risk/status', async (_req, res) => {
+  try {
+    const ctx = await getActiveMarketContext();
+    processOpenPositionExits(ctx);
+    const lastVol = ctx.candles.length > 0 ? ctx.candles[ctx.candles.length - 1].volatility : null;
+    const portfolio = computePortfolioSnapshot({
+      price: ctx.spotPrice,
+      timestampLabel: `${ctx.dateStr} ${ctx.timeStr} IST`,
+      rollingVolPct: lastVol,
+      dateStr: ctx.dateStr,
+    });
+    const riskTelemetry = computeRiskTelemetry(ctx, portfolio);
+    res.json({
+      riskTelemetry,
+      tradingSettings: getAppSettingsObject().trading,
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+app.post('/api/risk/reset-cooldown', async (_req, res) => {
+  try {
+    resetRiskCooldownState();
+    const ctx = await getActiveMarketContext();
+    const lastVol = ctx.candles.length > 0 ? ctx.candles[ctx.candles.length - 1].volatility : null;
+    const portfolio = computePortfolioSnapshot({
+      price: ctx.spotPrice,
+      timestampLabel: `${ctx.dateStr} ${ctx.timeStr} IST`,
+      rollingVolPct: lastVol,
+      dateStr: ctx.dateStr,
+    });
+    const riskTelemetry = computeRiskTelemetry(ctx, portfolio);
+    res.json({ success: true, riskTelemetry });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
 app.get('/api/portfolio', async (_req, res) => {
   try {
     const ctx = await getActiveMarketContext();
+    processOpenPositionExits(ctx);
     const lastVol = ctx.candles.length > 0 ? ctx.candles[ctx.candles.length - 1].volatility : null;
-    res.json(
-      computePortfolioSnapshot({
-        price: ctx.spotPrice,
-        timestampLabel: `${ctx.dateStr} ${ctx.timeStr} IST`,
-        rollingVolPct: lastVol,
-        dateStr: ctx.dateStr,
-      })
-    );
+    const snap = computePortfolioSnapshot({
+      price: ctx.spotPrice,
+      timestampLabel: `${ctx.dateStr} ${ctx.timeStr} IST`,
+      rollingVolPct: lastVol,
+      dateStr: ctx.dateStr,
+    });
+    const riskTelemetry = computeRiskTelemetry(ctx, snap);
+    res.json({
+      ...snap,
+      riskTelemetry,
+    });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
@@ -1585,7 +2095,8 @@ app.get('/api/portfolio', async (_req, res) => {
 app.post('/api/paper-trading/order', async (req, res) => {
   try {
     const ctx = await getActiveMarketContext();
-    const lastVol = ctx.candles.length > 0 ? ctx.candles[ctx.candles.length - 1].volatility : null;
+    const latestBar = ctx.candles.length > 0 ? ctx.candles[ctx.candles.length - 1] : null;
+    const lastVol = latestBar?.volatility ?? null;
     const instrumentType = req.body?.instrumentType === 'OPTION' ? 'OPTION' : 'INDEX';
     const side = req.body?.side === 'SELL' ? 'SELL' : 'BUY';
 
@@ -1604,6 +2115,7 @@ app.post('/api/paper-trading/order', async (req, res) => {
       notes: typeof req.body?.notes === 'string' ? req.body.notes : '',
       rationale: typeof req.body?.rationale === 'string' ? req.body.rationale : undefined,
       isAutoExecuted: false,
+      openedCandleTs: latestBar?.timestamp ?? null,
       markOverride: {
         price: ctx.spotPrice,
         timestampLabel: `${ctx.dateStr} ${ctx.timeStr} IST`,
@@ -1618,7 +2130,7 @@ app.post('/api/paper-trading/order', async (req, res) => {
   }
 });
 
-app.post('/api/paper-trading/auto-execute', (req, res) => {
+app.post('/api/paper-trading/auto-execute', async (req, res) => {
   try {
     const settings = getAppSettingsObject();
     if (typeof req.body?.enabled === 'boolean') {
@@ -1632,7 +2144,7 @@ app.post('/api/paper-trading/auto-execute', (req, res) => {
 
     let execution: unknown = null;
     if (settings.trading.autoExecuteSignals && req.body?.triggerNow !== false) {
-      execution = tryAutoExecuteLatestSignal();
+      execution = await tryAutoExecuteLatestSignal();
     }
 
     const logs = db.prepare('SELECT * FROM auto_execution_logs ORDER BY id DESC LIMIT 30').all();
@@ -1675,7 +2187,8 @@ app.post('/api/paper-trading/close', async (req, res) => {
     }
 
     const ctx = await getActiveMarketContext();
-    const lastVol = ctx.candles.length > 0 ? ctx.candles[ctx.candles.length - 1].volatility : null;
+    const latestBar = ctx.candles.length > 0 ? ctx.candles[ctx.candles.length - 1] : null;
+    const lastVol = latestBar?.volatility ?? null;
     const isOption = order.instrument_type === 'OPTION' && order.option_strike && order.option_type;
     const defaultExit = isOption
       ? getOptionMarkPremium({
@@ -1698,7 +2211,7 @@ app.post('/api/paper-trading/close', async (req, res) => {
     db.exec('BEGIN');
     try {
       db.prepare(
-        "UPDATE paper_orders SET status = 'CLOSED', exit_price = ?, realized_pnl = ?, closed_at = ? WHERE id = ?"
+        "UPDATE paper_orders SET status = 'CLOSED', exit_price = ?, realized_pnl = ?, exit_reason = 'Manual Close', closed_at = ? WHERE id = ?"
       ).run(Number(exitPrice.toFixed(2)), roundedPnl, now, orderId);
 
       db.prepare(
@@ -1709,6 +2222,8 @@ app.post('/api/paper-trading/close', async (req, res) => {
       db.exec('ROLLBACK');
       throw e;
     }
+
+    syncCooldownAfterOrderClose(latestBar?.timestamp ?? null);
 
     res.json({
       orderId,
@@ -1730,6 +2245,9 @@ app.post('/api/paper-trading/reset', (_req, res) => {
       db.prepare('DELETE FROM auto_execution_logs').run();
       db.prepare(
         'UPDATE paper_portfolio SET initial_capital = 100000, cash_balance = 100000, realized_pnl = 0, updated_at = ? WHERE id = 1'
+      ).run(now);
+      db.prepare(
+        'UPDATE risk_state SET cooldown_triggered_candle_ts = NULL, cooldown_triggered_wall_ms = NULL, cooldown_reason = NULL, last_reset_at = ? WHERE id = 1'
       ).run(now);
       db.exec('COMMIT');
     } catch (e) {
@@ -1798,6 +2316,7 @@ let lastStreamAutoKey = '';
 
 async function buildMarketStreamPayload(options?: { includeFullCandles?: boolean; forceLiveFetch?: boolean }) {
   const ctx = await getActiveMarketContext({ forceLiveFetch: options?.forceLiveFetch });
+  const autoClosedExits = processOpenPositionExits(ctx);
   const overview = buildOverviewFromContext(ctx);
   const optionsChain = buildOptionsChainFromContext(ctx);
   const lastVol = ctx.candles.length > 0 ? ctx.candles[ctx.candles.length - 1].volatility : null;
@@ -1807,13 +2326,13 @@ async function buildMarketStreamPayload(options?: { includeFullCandles?: boolean
     rollingVolPct: lastVol,
     dateStr: ctx.dateStr,
   };
-  const portfolio = computePortfolioSnapshot(markOverride);
+  let portfolio = computePortfolioSnapshot(markOverride);
 
   // If streaming in simulated_replay or free_live_nse and Auto-Execute is enabled,
   // auto-stage a paper trade when a new completed candle emits a BUY/SELL signal transition.
   const settings = getAppSettingsObject();
   const latest = ctx.candles[ctx.candles.length - 1] ?? null;
-  let streamAutoEvent: unknown = null;
+  let streamAutoEvent: unknown = autoClosedExits.length > 0 ? { autoClosed: true, exits: autoClosedExits } : null;
 
   if (
     settings.trading.autoExecuteSignals &&
@@ -1821,17 +2340,29 @@ async function buildMarketStreamPayload(options?: { includeFullCandles?: boolean
     latest &&
     (ctx.feedMode === 'free_live_nse' || ctx.feedMeta.isBarComplete)
   ) {
-    const predSignal = (overview.prediction as { signal?: string | null; optionRecommendation?: { contractName: string; strike: number; optionType: 'CE' | 'PE'; expiry: string; lotSize: number; entryPremium: number; stopLoss: number; targetPrice: number } | null; recommendation?: { reason: string } | null })?.signal;
-    const optRec = (overview.prediction as { optionRecommendation?: { contractName: string; strike: number; optionType: 'CE' | 'PE'; expiry: string; lotSize: number; entryPremium: number; stopLoss: number; targetPrice: number } | null })?.optionRecommendation;
+    const predSignal = (overview.prediction as { signal?: string | null; optionRecommendation?: { contractName: string; strike: number; optionType: 'CE' | 'PE'; expiry: string; lotSize: number; entryPremium: number; stopLoss: number; targetPrice: number; recommendedLots?: number } | null; recommendation?: { reason: string } | null })?.signal;
+    const optRec = (overview.prediction as { optionRecommendation?: { contractName: string; strike: number; optionType: 'CE' | 'PE'; expiry: string; lotSize: number; entryPremium: number; stopLoss: number; targetPrice: number; recommendedLots?: number } | null })?.optionRecommendation;
     const reason = (overview.prediction as { recommendation?: { reason: string } | null })?.recommendation?.reason ?? 'Streaming Random Forest signal';
 
     if ((predSignal === 'BUY' || predSignal === 'SELL') && optRec) {
       const autoKey = `${ctx.feedMode}_${latest.timestamp}_${predSignal}`;
       if (autoKey !== lastStreamAutoKey) {
         lastStreamAutoKey = autoKey;
-        const lots = Math.max(1, Number(settings.trading.defaultLots ?? 1));
+        const lots = Math.max(
+          1,
+          Number(
+            settings.trading.stopLossMode === 'atr_dynamic' && optRec.recommendedLots
+              ? optRec.recommendedLots
+              : settings.trading.defaultLots ?? 1
+          )
+        );
         const now = new Date().toISOString();
         try {
+          const blockReason = checkAutoExecutionGuardrails(ctx, portfolio);
+          if (blockReason) {
+            throw new Error(blockReason);
+          }
+
           const order = executeSimulatedOrder({
             instrumentType: 'OPTION',
             side: 'BUY',
@@ -1846,6 +2377,7 @@ async function buildMarketStreamPayload(options?: { includeFullCandles?: boolean
             notes: `Auto-Executed from ${ctx.feedMode} stream (${latest.date_str} ${latest.time_str})`,
             rationale: reason,
             isAutoExecuted: true,
+            openedCandleTs: latest.timestamp,
             markOverride,
           });
           db.prepare(
@@ -1861,12 +2393,13 @@ async function buildMarketStreamPayload(options?: { includeFullCandles?: boolean
             order.entryPrice,
             lots,
             order.capitalRequired,
-            `Stream Passed: Capital ₹${order.capitalRequired.toLocaleString('en-IN')} · Within Limits`,
+            `Stream Passed: Capital ₹${order.capitalRequired.toLocaleString('en-IN')} · ADX/Cooldown/Loss Cap Clear`,
             reason,
             order.orderId,
             now
           );
           streamAutoEvent = { executed: true, contract: optRec.contractName, orderId: order.orderId };
+          portfolio = computePortfolioSnapshot(markOverride);
         } catch (err) {
           const capReq = Number((optRec.entryPremium * optRec.lotSize * lots).toFixed(2));
           db.prepare(
@@ -1891,12 +2424,18 @@ async function buildMarketStreamPayload(options?: { includeFullCandles?: boolean
     }
   }
 
+  const riskTelemetry = computeRiskTelemetry(ctx, portfolio);
+
   return {
     type: 'market_tick',
     feedMode: ctx.feedMode,
     overview,
     optionsChain,
-    portfolio: streamAutoEvent ? computePortfolioSnapshot(markOverride) : portfolio,
+    portfolio: {
+      ...portfolio,
+      riskTelemetry,
+    },
+    riskTelemetry,
     latestCandle: latest,
     candles: options?.includeFullCandles ? ctx.candles : undefined,
     streamAutoEvent,

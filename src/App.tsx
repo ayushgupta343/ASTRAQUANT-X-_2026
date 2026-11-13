@@ -26,6 +26,7 @@ import {
   PaperOrderRecord,
   PaperPortfolioResponse,
   PaperTradePrefill,
+  RiskTelemetry,
   TradingSignalRecord,
 } from './types/trading';
 
@@ -64,6 +65,7 @@ export default function App() {
     }>
   >([]);
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [riskTelemetry, setRiskTelemetry] = useState<RiskTelemetry | null>(null);
   const [prefillOrder, setPrefillOrder] = useState<PaperTradePrefill | null>(null);
   const [feedMode, setFeedMode] = useState<MarketFeedMode>('historical_csv');
   const [switchingFeed, setSwitchingFeed] = useState(false);
@@ -108,6 +110,7 @@ export default function App() {
       setActiveDataset(ds.activeDataset);
       setPreview(ds.preview);
       setSettings(st.settings);
+      setRiskTelemetry(pf.riskTelemetry ?? null);
       setFeedMode(normalizeClientFeedMode(ov.feedMode ?? st.settings.dataSource.mode));
       applyTheme(st.settings.theme);
     } finally {
@@ -134,6 +137,9 @@ export default function App() {
         if (payload.overview) setOverview(payload.overview);
         if (payload.optionsChain) setOptionsChain(payload.optionsChain);
         if (payload.portfolio) setPortfolio(payload.portfolio);
+        if (payload.riskTelemetry ?? payload.portfolio?.riskTelemetry) {
+          setRiskTelemetry(payload.riskTelemetry ?? payload.portfolio?.riskTelemetry ?? null);
+        }
         if (payload.feedMode) setFeedMode(payload.feedMode);
 
         if (payload.candles && payload.candles.length > 0) {
@@ -155,7 +161,7 @@ export default function App() {
           });
         }
 
-        if (payload.streamAutoEvent?.executed) {
+        if (payload.streamAutoEvent?.executed || payload.streamAutoEvent?.autoClosed) {
           Promise.all([api.getPaperHistory(), api.getAutoExecuteLogs()]).then(([ph, al]) => {
             setPaperHistory(ph.orders);
             setAutoLogs(al.logs);
@@ -185,6 +191,7 @@ export default function App() {
       setOverview(res.overview);
       setOptionsChain(res.optionsChain);
       setPortfolio(res.portfolio);
+      if (res.portfolio.riskTelemetry) setRiskTelemetry(res.portfolio.riskTelemetry);
       if (res.candles && res.candles.length > 0) {
         setCandles(res.candles);
       }
@@ -198,6 +205,7 @@ export default function App() {
     setOverview(res.overview);
     setOptionsChain(res.optionsChain);
     setPortfolio(res.portfolio);
+    if (res.portfolio.riskTelemetry) setRiskTelemetry(res.portfolio.riskTelemetry);
     if (res.candles && res.candles.length > 0) {
       setCandles(res.candles);
     }
@@ -215,6 +223,7 @@ export default function App() {
       setCandles(cd.candles);
       setOptionsChain(oc);
       setPortfolio(pf);
+      if (pf.riskTelemetry) setRiskTelemetry(pf.riskTelemetry);
       return;
     }
     await refreshAll();
@@ -224,27 +233,34 @@ export default function App() {
     nEstimators: number;
     maxDepth: number;
     minSamplesSplit: number;
+    minConfidenceThreshold?: number;
+    walkForward?: boolean;
   }) => {
     const trained = await api.trainModel(
       params ?? {
         nEstimators: settings?.ml.nEstimators ?? 30,
         maxDepth: settings?.ml.maxDepth ?? 6,
         minSamplesSplit: settings?.ml.minSamplesSplit ?? 8,
+        minConfidenceThreshold: settings?.ml.minConfidenceThreshold ?? 0.65,
+        walkForward: settings?.ml.walkForwardEnabled ?? false,
       }
     );
     setModelStatus(trained);
-    const [ov, sg, pf, ph, al] = await Promise.all([
+    const [ov, sg, pf, ph, al, st] = await Promise.all([
       api.getMarketOverview(),
       api.getSignals(),
       api.getPortfolio(),
       api.getPaperHistory(),
       api.getAutoExecuteLogs(),
+      api.getSettings(),
     ]);
     setOverview(ov);
     setSignals(sg.signals);
     setPortfolio(pf);
+    if (pf.riskTelemetry) setRiskTelemetry(pf.riskTelemetry);
     setPaperHistory(ph.orders);
     setAutoLogs(al.logs);
+    setSettings(st.settings);
   };
 
   const handleStagePaperTrade = (prefill: PaperTradePrefill) => {
@@ -271,6 +287,7 @@ export default function App() {
     setPrefillOrder(null);
     const [pf, ph] = await Promise.all([api.getPortfolio(), api.getPaperHistory()]);
     setPortfolio(pf);
+    if (pf.riskTelemetry) setRiskTelemetry(pf.riskTelemetry);
     setPaperHistory(ph.orders);
   };
 
@@ -283,6 +300,7 @@ export default function App() {
       api.getSettings(),
     ]);
     setPortfolio(pf);
+    if (pf.riskTelemetry) setRiskTelemetry(pf.riskTelemetry);
     setPaperHistory(ph.orders);
     setSettings(st.settings);
   };
@@ -291,6 +309,7 @@ export default function App() {
     await api.closePaperOrder(orderId, exitPrice);
     const [pf, ph] = await Promise.all([api.getPortfolio(), api.getPaperHistory()]);
     setPortfolio(pf);
+    if (pf.riskTelemetry) setRiskTelemetry(pf.riskTelemetry);
     setPaperHistory(ph.orders);
   };
 
@@ -302,8 +321,16 @@ export default function App() {
       api.getAutoExecuteLogs(),
     ]);
     setPortfolio(pf);
+    if (pf.riskTelemetry) setRiskTelemetry(pf.riskTelemetry);
     setPaperHistory(ph.orders);
     setAutoLogs(al.logs);
+  };
+
+  const handleResetCooldown = async () => {
+    const res = await api.resetRiskCooldown();
+    setRiskTelemetry(res.riskTelemetry);
+    const pf = await api.getPortfolio();
+    setPortfolio(pf);
   };
 
   const handleRefreshOptionsChain = async (mode?: 'simulated' | 'csv') => {
@@ -365,6 +392,12 @@ export default function App() {
     targetPct: number;
     chargeBps: number;
     slippageBps: number;
+    useAtrDynamic?: boolean;
+    atrStopMult?: number;
+    atrTargetMult?: number;
+    useAdxFilter?: boolean;
+    adxMinThreshold?: number;
+    useConsecutiveLossCooldown?: boolean;
   }) => {
     const res = await api.runBacktest(config);
     const bt = await api.getBacktestResults();
@@ -376,6 +409,8 @@ export default function App() {
     const res = await api.saveSettings(updated);
     setSettings(res.settings);
     applyTheme(res.settings.theme);
+    const rs = await api.getRiskStatus();
+    setRiskTelemetry(rs.riskTelemetry);
   };
 
   if (activePage === 'home') {
@@ -434,6 +469,7 @@ export default function App() {
           history={paperHistory}
           optionsChain={optionsChain}
           settings={settings}
+          riskTelemetry={riskTelemetry}
           prefillOrder={prefillOrder}
           autoExecuteEnabled={Boolean(settings?.trading.autoExecuteSignals)}
           autoLogs={autoLogs}
@@ -441,6 +477,7 @@ export default function App() {
           onPlaceOrder={handlePlacePaperOrder}
           onCloseOrder={handleClosePaperOrder}
           onResetPortfolio={handleResetPaper}
+          onResetCooldown={handleResetCooldown}
         />
       )}
 
@@ -449,6 +486,7 @@ export default function App() {
           activeDataset={activeDataset}
           results={backtestResults}
           modelTrained={modelStatus?.status === 'Trained'}
+          settings={settings}
           isDark={isDark}
           onRunBacktest={handleRunBacktest}
           onUploadCSV={handleUploadCSV}
@@ -470,8 +508,11 @@ export default function App() {
       {activePage === 'risk' && (
         <RiskManagementPage
           currentPrice={overview?.currentPrice ?? 53760}
+          overview={overview}
           settings={settings}
+          riskTelemetry={riskTelemetry}
           onSaveRiskLimits={handleSaveSettings}
+          onResetCooldown={handleResetCooldown}
         />
       )}
 

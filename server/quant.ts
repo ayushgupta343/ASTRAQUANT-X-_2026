@@ -23,6 +23,15 @@ export interface EnrichedCandle extends CandleRow {
   candleBody: number;
   candleRange: number;
   relVolume: number | null;
+  vwap: number | null;
+  vwapDistance: number | null;
+  atr: number | null;
+  atrNormRange: number | null;
+  adx: number | null;
+  htfEma20Slope: number | null;
+  htfRsi14: number | null;
+  timeSin: number;
+  timeCos: number;
 }
 
 export interface ValidationReport {
@@ -43,7 +52,7 @@ export function computeEMA(values: Array<number | null>, period: number): Array<
   const result: Array<number | null> = new Array(values.length).fill(null);
   const k = 2 / (period + 1);
   let ema: number | null = null;
-  let validRun: number[] = [];
+  const validRun: number[] = [];
 
   for (let i = 0; i < values.length; i++) {
     const v = values[i];
@@ -126,13 +135,178 @@ export function computeMACD(closes: number[], fast = 12, slow = 26, signalPeriod
   const emaFast = computeEMA(closes, fast);
   const emaSlow = computeEMA(closes, slow);
   const macdLine: Array<number | null> = closes.map((_, i) =>
-    emaFast[i] !== null && emaSlow[i] !== null ? (emaFast[i]! - emaSlow[i]!) : null
+    emaFast[i] !== null && emaSlow[i] !== null ? emaFast[i]! - emaSlow[i]! : null
   );
   const signalLine = computeEMA(macdLine, signalPeriod);
   const histLine: Array<number | null> = macdLine.map((m, i) =>
     m !== null && signalLine[i] !== null ? m - signalLine[i]! : null
   );
   return { macdLine, signalLine, histLine };
+}
+
+/**
+ * Computes Wilder's ATR(14) causally.
+ */
+export function computeATR(candles: CandleRow[], period = 14): Array<number | null> {
+  const atr: Array<number | null> = new Array(candles.length).fill(null);
+  if (candles.length < period) return atr;
+
+  const tr: number[] = new Array(candles.length).fill(0);
+  for (let i = 0; i < candles.length; i++) {
+    const hl = candles[i].high - candles[i].low;
+    if (i === 0) {
+      tr[i] = hl;
+    } else {
+      const prevClose = candles[i - 1].close;
+      tr[i] = Math.max(hl, Math.abs(candles[i].high - prevClose), Math.abs(candles[i].low - prevClose));
+    }
+  }
+
+  let sumTr = 0;
+  for (let i = 0; i < period; i++) sumTr += tr[i];
+  let prevAtr = sumTr / period;
+  atr[period - 1] = prevAtr;
+
+  for (let i = period; i < candles.length; i++) {
+    prevAtr = (prevAtr * (period - 1) + tr[i]) / period;
+    atr[i] = prevAtr;
+  }
+  return atr;
+}
+
+/**
+ * Computes Wilder's ADX(14) trend-strength indicator causally.
+ */
+export function computeADX(candles: CandleRow[], period = 14): Array<number | null> {
+  const adx: Array<number | null> = new Array(candles.length).fill(null);
+  if (candles.length < period * 2) return adx;
+
+  const tr: number[] = new Array(candles.length).fill(0);
+  const plusDm: number[] = new Array(candles.length).fill(0);
+  const minusDm: number[] = new Array(candles.length).fill(0);
+
+  for (let i = 1; i < candles.length; i++) {
+    const upMove = candles[i].high - candles[i - 1].high;
+    const downMove = candles[i - 1].low - candles[i].low;
+    plusDm[i] = upMove > downMove && upMove > 0 ? upMove : 0;
+    minusDm[i] = downMove > upMove && downMove > 0 ? downMove : 0;
+    tr[i] = Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low - candles[i - 1].close)
+    );
+  }
+
+  let smoothedTr = 0;
+  let smoothedPlusDm = 0;
+  let smoothedMinusDm = 0;
+  for (let i = 1; i <= period; i++) {
+    smoothedTr += tr[i];
+    smoothedPlusDm += plusDm[i];
+    smoothedMinusDm += minusDm[i];
+  }
+
+  const dxSeries: number[] = [];
+  for (let i = period; i < candles.length; i++) {
+    if (i > period) {
+      smoothedTr = smoothedTr - smoothedTr / period + tr[i];
+      smoothedPlusDm = smoothedPlusDm - smoothedPlusDm / period + plusDm[i];
+      smoothedMinusDm = smoothedMinusDm - smoothedMinusDm / period + minusDm[i];
+    }
+    const plusDi = smoothedTr > 0 ? (100 * smoothedPlusDm) / smoothedTr : 0;
+    const minusDi = smoothedTr > 0 ? (100 * smoothedMinusDm) / smoothedTr : 0;
+    const diSum = plusDi + minusDi;
+    const dx = diSum > 0 ? (100 * Math.abs(plusDi - minusDi)) / diSum : 0;
+    dxSeries.push(dx);
+
+    if (dxSeries.length === period) {
+      const firstAdx = dxSeries.reduce((a, b) => a + b, 0) / period;
+      adx[i] = firstAdx;
+    } else if (dxSeries.length > period) {
+      const prev = adx[i - 1] ?? dx;
+      adx[i] = (prev * (period - 1) + dx) / period;
+    }
+  }
+  return adx;
+}
+
+function parseMinutesSinceMidnight(timeStr: string): number {
+  const parts = timeStr.split(':');
+  const hh = Number(parts[0] ?? 9);
+  const mm = Number(parts[1] ?? 15);
+  if (Number.isNaN(hh) || Number.isNaN(mm)) return 555;
+  return hh * 60 + mm;
+}
+
+/**
+ * Computes strictly causal higher-timeframe (15-minute) EMA(20) slope and RSI(14)
+ * mapped onto each 5-minute bar using ONLY completed 15-minute candles up to t.
+ */
+function computeCausalHtf15mFeatures(sorted: CandleRow[]): {
+  htfEma20Slope: Array<number | null>;
+  htfRsi14: Array<number | null>;
+} {
+  const n = sorted.length;
+  const htfEma20Slope: Array<number | null> = new Array(n).fill(null);
+  const htfRsi14: Array<number | null> = new Array(n).fill(null);
+
+  const completed15mCloses: number[] = [];
+  let activeBucketKey = '';
+  let activeBucketClose = 0;
+  let activeBucketFinalized = false;
+
+  const getLatestHtfMetrics = () => {
+    if (completed15mCloses.length < 15) {
+      return { rsiVal: null, slopeVal: null };
+    }
+    const rsiArr = computeRSI(completed15mCloses, 14);
+    const rsiVal = rsiArr[rsiArr.length - 1];
+    let slopeVal: number | null = null;
+    if (completed15mCloses.length >= 21) {
+      const emaArr = computeEMA(completed15mCloses, 20);
+      const curEma = emaArr[emaArr.length - 1];
+      const prevEma = emaArr[emaArr.length - 2];
+      if (curEma !== null && prevEma !== null && prevEma > 0) {
+        slopeVal = ((curEma - prevEma) / prevEma) * 100;
+      }
+    }
+    return { rsiVal, slopeVal };
+  };
+
+  for (let i = 0; i < n; i++) {
+    const c = sorted[i];
+    const mins = parseMinutesSinceMidnight(c.time_str);
+    const minsSince0915 = mins - 555;
+    const bucketIdx = minsSince0915 >= 0 ? Math.floor(minsSince0915 / 15) : Math.floor(mins / 15);
+    const bucketKey = `${c.date_str}_${bucketIdx}`;
+
+    // If a new 15m bucket started and previous bucket wasn't yet finalized (e.g., partial session), finalize previous now
+    if (activeBucketKey && bucketKey !== activeBucketKey && !activeBucketFinalized) {
+      completed15mCloses.push(activeBucketClose);
+      activeBucketFinalized = true;
+    }
+
+    if (bucketKey !== activeBucketKey) {
+      activeBucketKey = bucketKey;
+      activeBucketClose = c.close;
+      activeBucketFinalized = false;
+    } else {
+      activeBucketClose = c.close;
+    }
+
+    // Finalize current 15m bar strictly when the 3rd 5m bar in the 15m window completes (:25, :40, :55, :10)
+    const offsetIn15m = minsSince0915 >= 0 ? minsSince0915 % 15 : ((mins % 15) + 15) % 15;
+    if (!activeBucketFinalized && offsetIn15m >= 10) {
+      completed15mCloses.push(activeBucketClose);
+      activeBucketFinalized = true;
+    }
+
+    const { rsiVal, slopeVal } = getLatestHtfMetrics();
+    htfRsi14[i] = rsiVal !== null ? Number(rsiVal.toFixed(2)) : null;
+    htfEma20Slope[i] = slopeVal !== null ? Number(slopeVal.toFixed(4)) : null;
+  }
+
+  return { htfEma20Slope, htfRsi14 };
 }
 
 /**
@@ -148,6 +322,9 @@ export function calculateIndicators(candles: CandleRow[]): EnrichedCandle[] {
   const { macdLine, signalLine, histLine } = computeMACD(closes, 12, 26, 9);
   const ema20 = computeEMA(closes, 20);
   const sma50 = computeSMA(closes, 50);
+  const atr = computeATR(sorted, 14);
+  const adx = computeADX(sorted, 14);
+  const { htfEma20Slope, htfRsi14 } = computeCausalHtf15mFeatures(sorted);
 
   const returns1: Array<number | null> = sorted.map((c, i) =>
     i === 0 || sorted[i - 1].close === 0 ? null : (c.close - sorted[i - 1].close) / sorted[i - 1].close
@@ -176,7 +353,24 @@ export function calculateIndicators(candles: CandleRow[]): EnrichedCandle[] {
   const volSeries = sorted.map((c) => c.volume ?? 0);
   const volSma20 = hasVolume ? computeSMA(volSeries, 20) : new Array(sorted.length).fill(null);
 
+  // Intraday VWAP (resets cumulatively at the start of each NSE trading day)
+  let currentDay = '';
+  let cumTPV = 0;
+  let cumVol = 0;
+
   return sorted.map((c, i) => {
+    if (c.date_str !== currentDay) {
+      currentDay = c.date_str;
+      cumTPV = 0;
+      cumVol = 0;
+    }
+    const typicalPrice = (c.high + c.low + c.close) / 3;
+    const barVol = c.volume !== null && c.volume > 0 ? c.volume : 1;
+    cumTPV += typicalPrice * barVol;
+    cumVol += barVol;
+    const dayVwap = cumVol > 0 ? cumTPV / cumVol : typicalPrice;
+    const vwapDist = dayVwap > 0 ? (c.close - dayVwap) / dayVwap : 0;
+
     const baseOpen = c.open > 0 ? c.open : 1;
     const candleBody = ((c.close - c.open) / baseOpen) * 100;
     const candleRange = ((c.high - c.low) / baseOpen) * 100;
@@ -184,6 +378,14 @@ export function calculateIndicators(candles: CandleRow[]): EnrichedCandle[] {
       hasVolume && c.volume !== null && volSma20[i] && volSma20[i]! > 0
         ? c.volume / volSma20[i]!
         : null;
+
+    const barAtr = atr[i];
+    const atrNormRange = barAtr !== null && barAtr > 0 ? (c.high - c.low) / barAtr : null;
+
+    // Cyclical NSE session time features (09:15 IST to 15:30 IST = 375 mins)
+    const mins = parseMinutesSinceMidnight(c.time_str);
+    const elapsed = Math.max(0, Math.min(375, mins - 555));
+    const angle = (2 * Math.PI * elapsed) / 375;
 
     return {
       ...c,
@@ -199,6 +401,15 @@ export function calculateIndicators(candles: CandleRow[]): EnrichedCandle[] {
       candleBody: Number(candleBody.toFixed(4)),
       candleRange: Number(candleRange.toFixed(4)),
       relVolume: relVolume !== null ? Number(relVolume.toFixed(3)) : null,
+      vwap: Number(dayVwap.toFixed(2)),
+      vwapDistance: Number((vwapDist * 100).toFixed(4)),
+      atr: barAtr !== null ? Number(barAtr.toFixed(2)) : null,
+      atrNormRange: atrNormRange !== null ? Number(atrNormRange.toFixed(4)) : null,
+      adx: adx[i] !== null ? Number(adx[i]!.toFixed(2)) : null,
+      htfEma20Slope: htfEma20Slope[i],
+      htfRsi14: htfRsi14[i],
+      timeSin: Number(Math.sin(angle).toFixed(4)),
+      timeCos: Number(Math.cos(angle).toFixed(4)),
     };
   });
 }
@@ -422,3 +633,90 @@ export function cleanCandleDataset(candles: CandleRow[]): {
   const cleaned = Array.from(map.values()).sort((a, b) => a.timestamp - b.timestamp);
   return { cleaned, removedCount: removed };
 }
+
+export interface AtrRiskLevels {
+  entryPrice: number;
+  atr: number;
+  slPoints: number;
+  targetPoints: number;
+  stopLossPrice: number;
+  targetPrice: number;
+  riskReward: number;
+}
+
+/**
+ * Computes ATR-based dynamic Stop-Loss (default 1.2 × ATR) and Take-Profit (default 2.4 × ATR),
+ * strictly enforcing a minimum 1:2 Risk-to-Reward ratio.
+ */
+export function computeAtrRiskLevels(params: {
+  entryPrice: number;
+  atr: number;
+  direction: 'BUY' | 'SELL';
+  stopAtrMult?: number;
+  targetAtrMult?: number;
+}): AtrRiskLevels {
+  const stopMult = Math.max(0.5, params.stopAtrMult ?? 1.2);
+  const rawTargetMult = params.targetAtrMult ?? 2.4;
+  // Enforce minimum 1:2 R:R ratio
+  const targetMult = Math.max(rawTargetMult, stopMult * 2.0);
+
+  const safeAtr = Math.max(1, params.atr);
+  const slPoints = Number((safeAtr * stopMult).toFixed(2));
+  const targetPoints = Number((safeAtr * targetMult).toFixed(2));
+
+  const stopLossPrice =
+    params.direction === 'BUY'
+      ? Number(Math.max(1, params.entryPrice - slPoints).toFixed(2))
+      : Number((params.entryPrice + slPoints).toFixed(2));
+  const targetPrice =
+    params.direction === 'BUY'
+      ? Number((params.entryPrice + targetPoints).toFixed(2))
+      : Number(Math.max(1, params.entryPrice - targetPoints).toFixed(2));
+
+  return {
+    entryPrice: Number(params.entryPrice.toFixed(2)),
+    atr: Number(safeAtr.toFixed(2)),
+    slPoints,
+    targetPoints,
+    stopLossPrice,
+    targetPrice,
+    riskReward: Number((targetPoints / slPoints).toFixed(2)),
+  };
+}
+
+/**
+ * Computes volatility-adjusted Bank NIFTY lots (Lot Size = 15) so that a stop-out
+ * aligns with the configured Risk Per Trade % of capital.
+ */
+export function computeVolatilityPositionSize(params: {
+  capital: number;
+  riskPct: number;
+  slPointsPerUnit: number;
+  lotSize?: number;
+}): {
+  maxRiskRupees: number;
+  riskPerLot: number;
+  exactLots: number;
+  recommendedLots: number;
+  recommendedQty: number;
+  stopOutLossAtLots: number;
+} {
+  const lotSize = Math.max(1, params.lotSize ?? 15);
+  const maxRiskRupees = Number(((Math.max(1000, params.capital) * Math.max(0.1, params.riskPct)) / 100).toFixed(2));
+  const slDist = Math.max(0.5, params.slPointsPerUnit);
+  const riskPerLot = Number((slDist * lotSize).toFixed(2));
+  const exactLots = riskPerLot > 0 ? maxRiskRupees / riskPerLot : 1;
+  const recommendedLots = Math.max(1, Math.floor(exactLots));
+  const recommendedQty = recommendedLots * lotSize;
+  const stopOutLossAtLots = Number((recommendedLots * riskPerLot).toFixed(2));
+
+  return {
+    maxRiskRupees,
+    riskPerLot,
+    exactLots: Number(exactLots.toFixed(2)),
+    recommendedLots,
+    recommendedQty,
+    stopOutLossAtLots,
+  };
+}
+

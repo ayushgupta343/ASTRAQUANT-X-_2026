@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS ml_models (
   feature_importance_json JSONB NOT NULL,
   prediction_history_json JSONB NOT NULL,
   model_artifact_json JSONB NOT NULL,
+  min_confidence_threshold NUMERIC(4, 2) DEFAULT 0.65,
+  high_conviction_json JSONB,
+  walk_forward_json JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -117,6 +120,8 @@ CREATE TABLE IF NOT EXISTS paper_orders (
   lots INTEGER DEFAULT 1,
   is_auto_executed BOOLEAN DEFAULT FALSE,
   rationale TEXT,
+  opened_candle_ts BIGINT,
+  exit_reason TEXT,
   opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   closed_at TIMESTAMPTZ
 );
@@ -157,7 +162,16 @@ CREATE TABLE IF NOT EXISTS backtests (
   metrics_json JSONB NOT NULL,
   equity_curve_json JSONB NOT NULL,
   trades_json JSONB NOT NULL,
+  comparison_json JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS risk_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  cooldown_triggered_candle_ts BIGINT,
+  cooldown_triggered_wall_ms BIGINT,
+  cooldown_reason TEXT,
+  last_reset_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS app_settings (

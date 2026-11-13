@@ -8,13 +8,14 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { History, Play, Upload } from 'lucide-react';
-import { BacktestRunResult, DatasetMeta } from '../types/trading';
+import { History, Play, ShieldCheck, Upload } from 'lucide-react';
+import { AppSettings, BacktestRunResult, DatasetMeta } from '../types/trading';
 
 interface BacktestingPageProps {
   activeDataset: DatasetMeta | null;
   results: BacktestRunResult[];
   modelTrained: boolean;
+  settings: AppSettings | null;
   isDark: boolean;
   onRunBacktest: (config: {
     strategy: string;
@@ -26,6 +27,12 @@ interface BacktestingPageProps {
     targetPct: number;
     chargeBps: number;
     slippageBps: number;
+    useAtrDynamic?: boolean;
+    atrStopMult?: number;
+    atrTargetMult?: number;
+    useAdxFilter?: boolean;
+    adxMinThreshold?: number;
+    useConsecutiveLossCooldown?: boolean;
   }) => Promise<BacktestRunResult>;
   onUploadCSV: (file: File) => Promise<void>;
 }
@@ -34,6 +41,7 @@ export const BacktestingPage: React.FC<BacktestingPageProps> = ({
   activeDataset,
   results,
   modelTrained,
+  settings,
   isDark,
   onRunBacktest,
   onUploadCSV,
@@ -45,16 +53,26 @@ export const BacktestingPage: React.FC<BacktestingPageProps> = ({
   const [endDate, setEndDate] = useState(activeDataset?.end_date ?? '');
   const [initialCapital, setInitialCapital] = useState(100000);
   const [positionSize, setPositionSize] = useState(15);
-  const [stopLossPct, setStopLossPct] = useState(0.35);
-  const [targetPct, setTargetPct] = useState(0.7);
+  const [stopLossPct, setStopLossPct] = useState(settings?.trading.defaultStopLossPct ?? 0.35);
+  const [targetPct, setTargetPct] = useState(settings?.trading.defaultTargetPct ?? 0.7);
   const [chargeBps, setChargeBps] = useState(3);
   const [slippageBps, setSlippageBps] = useState(2);
+
+  // Guardrail toggles for causal filtered vs unfiltered comparison
+  const [useAtrDynamic, setUseAtrDynamic] = useState(
+    (settings?.trading.stopLossMode ?? 'atr_dynamic') === 'atr_dynamic'
+  );
+  const [useAdxFilter, setUseAdxFilter] = useState(settings?.trading.adxChopFilterEnabled ?? true);
+  const [useConsecutiveLossCooldown, setUseConsecutiveLossCooldown] = useState(
+    settings?.trading.consecutiveLossCooldownEnabled ?? true
+  );
 
   const [activeResult, setActiveResult] = useState<BacktestRunResult | null>(results[0] ?? null);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const displayResult = activeResult ?? results[0] ?? null;
+  const cmp = displayResult?.baselineComparison;
 
   const handleRun = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -71,6 +89,12 @@ export const BacktestingPage: React.FC<BacktestingPageProps> = ({
         targetPct,
         chargeBps,
         slippageBps,
+        useAtrDynamic,
+        atrStopMult: settings?.trading.atrStopMult ?? 1.2,
+        atrTargetMult: settings?.trading.atrTargetMult ?? 2.4,
+        useAdxFilter,
+        adxMinThreshold: settings?.trading.adxMinThreshold ?? 18,
+        useConsecutiveLossCooldown,
       });
       setActiveResult(res);
     } catch (err) {
@@ -99,7 +123,7 @@ export const BacktestingPage: React.FC<BacktestingPageProps> = ({
       <div className="rounded-lg border border-sky-500/30 bg-sky-500/8 px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
         <div className="text-slate-700 dark:text-slate-200">
           <strong>Index-Direction Spot Simulation:</strong> Tests Bank NIFTY 5-minute index entries causally with
-          brokerage and slippage. Actual Options Contract (CE/PE) backtesting requires historical option premium data.
+          brokerage, slippage, ATR dynamic stops, ADX chop filtering, and loss-cooldown guardrails.
         </div>
         <label className="cursor-pointer inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-medium hover:border-sky-500">
           <Upload className="w-3.5 h-3.5 text-sky-500" />
@@ -176,7 +200,7 @@ export const BacktestingPage: React.FC<BacktestingPageProps> = ({
             />
           </div>
           <div>
-            <label className="block text-slate-500 mb-1">Stop-Loss (%)</label>
+            <label className="block text-slate-500 mb-1">Fallback Stop-Loss (%)</label>
             <input
               type="number"
               min={0.05}
@@ -187,7 +211,7 @@ export const BacktestingPage: React.FC<BacktestingPageProps> = ({
             />
           </div>
           <div>
-            <label className="block text-slate-500 mb-1">Target (%)</label>
+            <label className="block text-slate-500 mb-1">Fallback Target (%)</label>
             <input
               type="number"
               min={0.05}
@@ -218,6 +242,41 @@ export const BacktestingPage: React.FC<BacktestingPageProps> = ({
               />
             </div>
           </div>
+        </div>
+
+        {/* Causal Risk Guardrails Row */}
+        <div className="pt-2 border-t border-slate-200 dark:border-slate-800/80 flex flex-wrap items-center gap-5 text-xs">
+          <span className="font-semibold text-slate-600 dark:text-slate-300">Causal Risk Guardrails:</span>
+          <label className="inline-flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={useAtrDynamic}
+              onChange={(e) => setUseAtrDynamic(e.target.checked)}
+              className="rounded border-slate-400 text-sky-600 focus:ring-sky-500"
+            />
+            <span>ATR-Dynamic Stops ({settings?.trading.atrStopMult ?? 1.2}× / {settings?.trading.atrTargetMult ?? 2.4}× ATR)</span>
+          </label>
+          <label className="inline-flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={useAdxFilter}
+              onChange={(e) => setUseAdxFilter(e.target.checked)}
+              className="rounded border-slate-400 text-sky-600 focus:ring-sky-500"
+            />
+            <span>ADX Chop Filter (ADX(14) &lt; {settings?.trading.adxMinThreshold ?? 18})</span>
+          </label>
+          <label className="inline-flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={useConsecutiveLossCooldown}
+              onChange={(e) => setUseConsecutiveLossCooldown(e.target.checked)}
+              className="rounded border-slate-400 text-sky-600 focus:ring-sky-500"
+            />
+            <span>
+              Consecutive-Loss Cooldown ({settings?.trading.cooldownCandles ?? 6} candles after{' '}
+              {settings?.trading.consecutiveLossLimit ?? 2} losses)
+            </span>
+          </label>
         </div>
 
         {error && (
@@ -302,6 +361,96 @@ export const BacktestingPage: React.FC<BacktestingPageProps> = ({
             </span>
             <span className="text-slate-500 font-sans">Window: {displayResult.dateRange}</span>
           </div>
+
+          {/* Filtered vs. Unfiltered Risk Guardrail Comparison */}
+          {cmp && (
+            <div className="rounded-xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-5 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-emerald-500" />
+                  <div>
+                    <h3 className="font-display text-base font-semibold">
+                      Filtered (Risk Guardrails) vs. Unfiltered Baseline
+                    </h3>
+                    <p className="text-xs text-slate-500">
+                      Side-by-side causal impact of ATR-Dynamic Stops, ADX(&lt;{cmp.guardrailsApplied.adxMinThreshold}) Chop Filter, and Loss Cooldown
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-3 text-xs font-mono tabular-nums text-slate-500">
+                  <span>
+                    ADX Blocked: <strong className="text-amber-500">{cmp.blockedByAdxCount}</strong>
+                  </span>
+                  <span>
+                    Cooldown Blocked: <strong className="text-red-500">{cmp.blockedByCooldownCount}</strong>
+                  </span>
+                  <span>
+                    ATR Trades: <strong className="text-sky-500">{cmp.atrDynamicTradesCount}</strong>
+                  </span>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs font-mono tabular-nums">
+                  <thead>
+                    <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500 text-left">
+                      <th className="py-2 px-3 font-sans">Backtest Mode</th>
+                      <th className="py-2 px-3 text-right font-sans">Trades</th>
+                      <th className="py-2 px-3 text-right font-sans">Win Rate</th>
+                      <th className="py-2 px-3 text-right font-sans">Profit Factor</th>
+                      <th className="py-2 px-3 text-right font-sans">Max Drawdown</th>
+                      <th className="py-2 px-3 text-right font-sans">Total Return</th>
+                      <th className="py-2 px-3 text-right font-sans">Net Profit</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200 dark:divide-slate-800/60">
+                    <tr className="bg-sky-500/5">
+                      <td className="py-2.5 px-3 font-sans font-semibold text-sky-600 dark:text-sky-400">
+                        Filtered (With Risk Guardrails)
+                      </td>
+                      <td className="py-2.5 px-3 text-right">{cmp.filtered.totalTrades}</td>
+                      <td className="py-2.5 px-3 text-right font-semibold">{cmp.filtered.winRatePct.toFixed(1)}%</td>
+                      <td className="py-2.5 px-3 text-right font-semibold">{cmp.filtered.profitFactor.toFixed(2)}</td>
+                      <td className="py-2.5 px-3 text-right text-red-500">-{cmp.filtered.maxDrawdownPct.toFixed(2)}%</td>
+                      <td
+                        className={`py-2.5 px-3 text-right font-semibold ${
+                          cmp.filtered.totalReturnPct >= 0 ? 'text-emerald-500' : 'text-red-500'
+                        }`}
+                      >
+                        {cmp.filtered.totalReturnPct >= 0 ? '+' : ''}
+                        {cmp.filtered.totalReturnPct.toFixed(2)}%
+                      </td>
+                      <td
+                        className={`py-2.5 px-3 text-right font-semibold ${
+                          cmp.filtered.netProfit >= 0 ? 'text-emerald-500' : 'text-red-500'
+                        }`}
+                      >
+                        {cmp.filtered.netProfit >= 0 ? '+' : ''}₹{cmp.filtered.netProfit.toFixed(2)}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td className="py-2.5 px-3 font-sans text-slate-600 dark:text-slate-300">
+                        Unfiltered (Raw Signals · Fixed %)
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-slate-500">{cmp.unfiltered.totalTrades}</td>
+                      <td className="py-2.5 px-3 text-right text-slate-500">{cmp.unfiltered.winRatePct.toFixed(1)}%</td>
+                      <td className="py-2.5 px-3 text-right text-slate-500">{cmp.unfiltered.profitFactor.toFixed(2)}</td>
+                      <td className="py-2.5 px-3 text-right text-red-500/80">
+                        -{cmp.unfiltered.maxDrawdownPct.toFixed(2)}%
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-slate-500">
+                        {cmp.unfiltered.totalReturnPct >= 0 ? '+' : ''}
+                        {cmp.unfiltered.totalReturnPct.toFixed(2)}%
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-slate-500">
+                        {cmp.unfiltered.netProfit >= 0 ? '+' : ''}₹{cmp.unfiltered.netProfit.toFixed(2)}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
 
           {/* Equity Curve */}
           <div className="rounded-xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-5">
@@ -439,7 +588,7 @@ export const BacktestingPage: React.FC<BacktestingPageProps> = ({
         </div>
       ) : (
         <div className="rounded-xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0D131F] p-10 text-center text-sm text-slate-500">
-          Configure parameters above and click <strong>Run Historical Backtest</strong> to compute equity curve, Sharpe ratio, and trade history.
+          Configure parameters above and click <strong>Run Historical Backtest</strong> to compute equity curve, Sharpe ratio, and filtered vs. unfiltered comparison.
         </div>
       )}
     </div>

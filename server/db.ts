@@ -69,6 +69,9 @@ export function initDatabase() {
       feature_importance_json TEXT NOT NULL,
       prediction_history_json TEXT NOT NULL,
       model_artifact_json TEXT NOT NULL,
+      min_confidence_threshold REAL DEFAULT 0.65,
+      high_conviction_json TEXT,
+      walk_forward_json TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -132,6 +135,8 @@ export function initDatabase() {
       lots INTEGER DEFAULT 1,
       is_auto_executed INTEGER DEFAULT 0,
       rationale TEXT,
+      opened_candle_ts INTEGER,
+      exit_reason TEXT,
       opened_at TEXT NOT NULL,
       closed_at TEXT
     );
@@ -172,7 +177,16 @@ export function initDatabase() {
       metrics_json TEXT NOT NULL,
       equity_curve_json TEXT NOT NULL,
       trades_json TEXT NOT NULL,
+      comparison_json TEXT,
       created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS risk_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      cooldown_triggered_candle_ts INTEGER,
+      cooldown_triggered_wall_ms INTEGER,
+      cooldown_reason TEXT,
+      last_reset_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS app_settings (
@@ -201,6 +215,12 @@ export function initDatabase() {
     "ALTER TABLE paper_orders ADD COLUMN lots INTEGER DEFAULT 1",
     "ALTER TABLE paper_orders ADD COLUMN is_auto_executed INTEGER DEFAULT 0",
     "ALTER TABLE paper_orders ADD COLUMN rationale TEXT",
+    "ALTER TABLE ml_models ADD COLUMN min_confidence_threshold REAL DEFAULT 0.65",
+    "ALTER TABLE ml_models ADD COLUMN high_conviction_json TEXT",
+    "ALTER TABLE ml_models ADD COLUMN walk_forward_json TEXT",
+    "ALTER TABLE paper_orders ADD COLUMN opened_candle_ts INTEGER",
+    "ALTER TABLE paper_orders ADD COLUMN exit_reason TEXT",
+    "ALTER TABLE backtests ADD COLUMN comparison_json TEXT",
   ];
   for (const sql of alterStatements) {
     try {
@@ -218,6 +238,14 @@ export function initDatabase() {
     ).run(new Date().toISOString());
   }
 
+  // Initialize risk_state if not present
+  const existingRiskState = db.prepare('SELECT id FROM risk_state WHERE id = 1').get();
+  if (!existingRiskState) {
+    db.prepare(
+      "INSERT INTO risk_state (id, cooldown_triggered_candle_ts, cooldown_triggered_wall_ms, cooldown_reason, last_reset_at) VALUES (1, NULL, NULL, NULL, '')"
+    ).run();
+  }
+
   // Initialize default settings if not present
   const existingSettings = db.prepare('SELECT id FROM app_settings WHERE id = 1').get();
   if (!existingSettings) {
@@ -229,15 +257,28 @@ export function initDatabase() {
         minSamplesSplit: 8,
         horizonCandles: 3,
         signalThresholdPct: 0.1,
+        minConfidenceThreshold: 0.65,
+        walkForwardEnabled: false,
       },
       trading: {
         defaultQuantity: 15,
         defaultLots: 1,
+        riskPerTradePct: 1.0,
+        stopLossMode: 'atr_dynamic',
+        atrStopMult: 1.2,
+        atrTargetMult: 2.4,
         defaultStopLossPct: 0.35,
         defaultTargetPct: 0.7,
         maxOpenPositions: 3,
-        dailyMaxLoss: 5000,
+        dailyMaxLoss: 3000,
         autoExecuteSignals: false,
+        adxChopFilterEnabled: true,
+        adxMinThreshold: 18,
+        consecutiveLossCooldownEnabled: true,
+        consecutiveLossLimit: 2,
+        cooldownCandles: 6,
+        timeBasedOptionExitEnabled: true,
+        optionMaxHoldCandles: 6,
       },
       dataSource: {
         mode: 'sample_historical',
@@ -482,15 +523,30 @@ export function getAppSettingsObject() {
       minSamplesSplit: parsed.ml?.minSamplesSplit ?? 8,
       horizonCandles: parsed.ml?.horizonCandles ?? 3,
       signalThresholdPct: parsed.ml?.signalThresholdPct ?? 0.1,
+      minConfidenceThreshold: parsed.ml?.minConfidenceThreshold ?? 0.65,
+      walkForwardEnabled: Boolean(parsed.ml?.walkForwardEnabled ?? false),
     },
     trading: {
       defaultQuantity: parsed.trading?.defaultQuantity ?? 15,
       defaultLots: parsed.trading?.defaultLots ?? 1,
+      riskPerTradePct: parsed.trading?.riskPerTradePct ?? 1.0,
+      stopLossMode: (parsed.trading?.stopLossMode === 'fixed_pct' ? 'fixed_pct' : 'atr_dynamic') as
+        | 'atr_dynamic'
+        | 'fixed_pct',
+      atrStopMult: parsed.trading?.atrStopMult ?? 1.2,
+      atrTargetMult: parsed.trading?.atrTargetMult ?? 2.4,
       defaultStopLossPct: parsed.trading?.defaultStopLossPct ?? 0.35,
       defaultTargetPct: parsed.trading?.defaultTargetPct ?? 0.7,
       maxOpenPositions: parsed.trading?.maxOpenPositions ?? 3,
-      dailyMaxLoss: parsed.trading?.dailyMaxLoss ?? 5000,
+      dailyMaxLoss: parsed.trading?.dailyMaxLoss ?? 3000,
       autoExecuteSignals: Boolean(parsed.trading?.autoExecuteSignals ?? false),
+      adxChopFilterEnabled: Boolean(parsed.trading?.adxChopFilterEnabled ?? true),
+      adxMinThreshold: parsed.trading?.adxMinThreshold ?? 18,
+      consecutiveLossCooldownEnabled: Boolean(parsed.trading?.consecutiveLossCooldownEnabled ?? true),
+      consecutiveLossLimit: parsed.trading?.consecutiveLossLimit ?? 2,
+      cooldownCandles: parsed.trading?.cooldownCandles ?? 6,
+      timeBasedOptionExitEnabled: Boolean(parsed.trading?.timeBasedOptionExitEnabled ?? true),
+      optionMaxHoldCandles: parsed.trading?.optionMaxHoldCandles ?? 6,
     },
     dataSource: {
       mode: parsed.dataSource?.mode ?? 'sample_historical',

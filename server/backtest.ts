@@ -1,4 +1,4 @@
-import { CandleRow, EnrichedCandle, calculateIndicators } from './quant.ts';
+import { CandleRow, EnrichedCandle, calculateIndicators, computeAtrRiskLevels } from './quant.ts';
 import { RandomForestArtifact, extractFeatureVector, predictWithForest } from './randomForest.ts';
 
 export type BacktestStrategy = 'ml_random_forest' | 'rsi_macd_confluence' | 'ema_sma_crossover';
@@ -13,6 +13,14 @@ export interface BacktestConfig {
   targetPct: number;    // e.g., 0.70 (%)
   chargeBps: number;    // Transaction charges in basis points per leg (e.g. 3 bps)
   slippageBps: number;  // Slippage in basis points per leg (e.g. 2 bps)
+  useAtrDynamic?: boolean;
+  atrStopMult?: number;
+  atrTargetMult?: number;
+  useAdxFilter?: boolean;
+  adxMinThreshold?: number;
+  useConsecutiveLossCooldown?: boolean;
+  consecutiveLossLimit?: number;
+  cooldownCandles?: number;
 }
 
 export interface BacktestTrade {
@@ -27,6 +35,31 @@ export interface BacktestTrade {
   costs: number;
   netPnl: number;
   exitReason: 'Target Hit' | 'Stop-Loss Hit' | 'Signal Reversal' | 'End of Window';
+}
+
+export interface BacktestSummarySlice {
+  winRatePct: number;
+  profitFactor: number;
+  maxDrawdownPct: number;
+  totalReturnPct: number;
+  netProfit: number;
+  totalTrades: number;
+  sharpeRatio: number;
+}
+
+export interface BacktestBaselineComparison {
+  filtered: BacktestSummarySlice;
+  unfiltered: BacktestSummarySlice;
+  blockedByAdxCount: number;
+  blockedByCooldownCount: number;
+  atrDynamicTradesCount: number;
+  guardrailsApplied: {
+    atrDynamic: boolean;
+    adxFilter: boolean;
+    consecutiveLossCooldown: boolean;
+    adxMinThreshold: number;
+    cooldownCandles: number;
+  };
 }
 
 export interface BacktestResult {
@@ -50,6 +83,7 @@ export interface BacktestResult {
     avgLossPerTrade: number;
     totalCosts: number;
   };
+  baselineComparison: BacktestBaselineComparison;
   equityCurve: Array<{
     time: string;
     equity: number;
@@ -58,42 +92,25 @@ export interface BacktestResult {
   trades: BacktestTrade[];
 }
 
-export function runHistoricalBacktest(
-  rawCandles: CandleRow[],
+function simulateBacktestPass(
+  filtered: EnrichedCandle[],
   config: BacktestConfig,
-  rfArtifact?: RandomForestArtifact | null,
-  minMlTimestamp?: number | null
-): BacktestResult {
-  if (config.strategy === 'ml_random_forest' && !rfArtifact) {
-    throw new Error(
-      'Random Forest model is not trained yet. Train the model on the AI/ML Prediction page first, or choose RSI + MACD Confluence / EMA Crossover.'
-    );
+  rfArtifact: RandomForestArtifact | null | undefined,
+  flags: {
+    useAtrDynamic: boolean;
+    useAdxFilter: boolean;
+    useConsecutiveLossCooldown: boolean;
   }
-
-  // Calculate indicators on full ordered dataset first (strictly causal) before filtering date range
-  const allEnriched = calculateIndicators(rawCandles);
-  let filtered: EnrichedCandle[] = allEnriched.filter((c) => {
-    if (config.startDate && c.date_str < config.startDate) return false;
-    if (config.endDate && c.date_str > config.endDate) return false;
-    return true;
-  });
-
-  // Prevent look-ahead / in-sample leakage when backtesting the trained Random Forest
-  if (config.strategy === 'ml_random_forest' && minMlTimestamp) {
-    const oosFiltered = filtered.filter((c) => c.timestamp >= minMlTimestamp);
-    if (oosFiltered.length >= 25) {
-      filtered = oosFiltered;
-    }
-  }
-
-  if (filtered.length < 25) {
-    throw new Error('Selected date range contains fewer than 25 candles. Expand the date range to run a valid backtest.');
-  }
-
+) {
   const slippageMult = config.slippageBps / 10000;
   const chargeMult = config.chargeBps / 10000;
   const slMult = config.stopLossPct / 100;
   const tgtMult = config.targetPct / 100;
+  const atrStopMult = config.atrStopMult ?? 1.2;
+  const atrTargetMult = Math.max(atrStopMult * 2.0, config.atrTargetMult ?? 2.4);
+  const adxMinThreshold = config.adxMinThreshold ?? 18;
+  const consecutiveLossLimit = Math.max(1, config.consecutiveLossLimit ?? 2);
+  const cooldownCandles = Math.max(1, config.cooldownCandles ?? 6);
 
   let equity = config.initialCapital;
   let peakEquity = equity;
@@ -113,6 +130,12 @@ export function runHistoricalBacktest(
   const equityCurve: BacktestResult['equityCurve'] = [];
   const dailyEndEquity = new Map<string, number>();
   let totalCosts = 0;
+
+  let consecutiveLosses = 0;
+  let cooldownRemaining = 0;
+  let blockedByAdxCount = 0;
+  let blockedByCooldownCount = 0;
+  let atrDynamicTradesCount = 0;
 
   const closePosition = (
     pos: OpenPos,
@@ -134,6 +157,16 @@ export function runHistoricalBacktest(
 
     equity += netPnl;
     totalCosts += costs;
+
+    if (netPnl <= 0) {
+      consecutiveLosses += 1;
+      if (flags.useConsecutiveLossCooldown && consecutiveLosses >= consecutiveLossLimit) {
+        cooldownRemaining = cooldownCandles;
+        consecutiveLosses = 0;
+      }
+    } else {
+      consecutiveLosses = 0;
+    }
 
     trades.push({
       id: trades.length + 1,
@@ -182,9 +215,7 @@ export function runHistoricalBacktest(
       const vec = extractFeatureVector(prevBar);
       if (vec) {
         const pred = predictWithForest(rfArtifact, vec);
-        if (pred.confidence >= 40) {
-          signal = pred.signal;
-        }
+        signal = pred.signal;
       }
     } else if (config.strategy === 'rsi_macd_confluence') {
       if (prevBar.rsi !== null && prevBar.macdHist !== null) {
@@ -198,24 +229,60 @@ export function runHistoricalBacktest(
       }
     }
 
-    // 3. Reversal exit or fresh entry at bar.open
+    // 3. Reversal exit
     if (openPos && signal !== 'HOLD' && signal !== openPos.side) {
       closePosition(openPos, bar.open, barLabel, 'Signal Reversal');
       openPos = null;
     }
 
-    if (!openPos && (signal === 'BUY' || signal === 'SELL') && i < filtered.length - 1) {
+    // 4. Risk Guardrail Filtering on fresh entries (Consecutive-Loss Cooldown + ADX Chop Filter)
+    let entrySignal: 'BUY' | 'SELL' | 'HOLD' = signal;
+    if (!openPos && (entrySignal === 'BUY' || entrySignal === 'SELL')) {
+      if (flags.useConsecutiveLossCooldown && cooldownRemaining > 0) {
+        blockedByCooldownCount++;
+        entrySignal = 'HOLD';
+      } else if (flags.useAdxFilter && prevBar.adx !== null && prevBar.adx < adxMinThreshold) {
+        blockedByAdxCount++;
+        entrySignal = 'HOLD';
+      }
+    }
+
+    if (!openPos && (entrySignal === 'BUY' || entrySignal === 'SELL') && i < filtered.length - 1) {
       const execEntry: number =
-        signal === 'BUY' ? bar.open * (1 + slippageMult) : bar.open * (1 - slippageMult);
+        entrySignal === 'BUY' ? bar.open * (1 + slippageMult) : bar.open * (1 - slippageMult);
       const entryCost: number = execEntry * config.positionSize * chargeMult;
+
+      let stopLoss: number;
+      let target: number;
+
+      if (flags.useAtrDynamic && prevBar.atr !== null && prevBar.atr > 0) {
+        const atrLevels = computeAtrRiskLevels({
+          entryPrice: execEntry,
+          atr: prevBar.atr,
+          direction: entrySignal,
+          stopAtrMult: atrStopMult,
+          targetAtrMult: atrTargetMult,
+        });
+        stopLoss = atrLevels.stopLossPrice;
+        target = atrLevels.targetPrice;
+        atrDynamicTradesCount++;
+      } else {
+        stopLoss = entrySignal === 'BUY' ? execEntry * (1 - slMult) : execEntry * (1 + slMult);
+        target = entrySignal === 'BUY' ? execEntry * (1 + tgtMult) : execEntry * (1 - tgtMult);
+      }
+
       openPos = {
-        side: signal,
+        side: entrySignal,
         entryPrice: execEntry,
         entryTime: barLabel,
-        stopLoss: signal === 'BUY' ? execEntry * (1 - slMult) : execEntry * (1 + slMult),
-        target: signal === 'BUY' ? execEntry * (1 + tgtMult) : execEntry * (1 - tgtMult),
+        stopLoss,
+        target,
         entryCost,
       };
+    }
+
+    if (cooldownRemaining > 0) {
+      cooldownRemaining -= 1;
     }
 
     // Mark-to-market equity for drawdown & curve
@@ -234,7 +301,6 @@ export function runHistoricalBacktest(
 
     dailyEndEquity.set(bar.date_str, mtm);
 
-    // Sample equity curve points so chart stays responsive (every bar if <= 250, else stride)
     const stride = filtered.length > 250 ? Math.ceil(filtered.length / 220) : 1;
     if (i % stride === 0 || i === filtered.length - 1) {
       equityCurve.push({
@@ -263,7 +329,6 @@ export function runHistoricalBacktest(
   const winRatePct = trades.length > 0 ? (winning.length / trades.length) * 100 : 0;
   const profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? 99.9 : 0;
 
-  // Daily-aggregated Sharpe Ratio (annualized with sqrt(252))
   const dailyVals = [config.initialCapital, ...Array.from(dailyEndEquity.values())];
   const dailyReturns: number[] = [];
   for (let d = 1; d < dailyVals.length; d++) {
@@ -280,10 +345,6 @@ export function runHistoricalBacktest(
   const sharpeRatio = stdRet > 1e-9 ? Math.max(-10, Math.min(10, (meanRet / stdRet) * Math.sqrt(252))) : 0;
 
   return {
-    backtestType: 'Index-Direction Spot Simulation (Not Options Contracts)',
-    strategy: config.strategy,
-    dateRange: `${filtered[0].date_str} to ${filtered[filtered.length - 1].date_str}`,
-    barsTested: filtered.length,
     metrics: {
       initialCapital: config.initialCapital,
       finalCapital: Number(equity.toFixed(2)),
@@ -301,6 +362,100 @@ export function runHistoricalBacktest(
       totalCosts: Number(totalCosts.toFixed(2)),
     },
     equityCurve,
-    trades: trades.slice(-150).reverse(),
+    trades,
+    blockedByAdxCount,
+    blockedByCooldownCount,
+    atrDynamicTradesCount,
+  };
+}
+
+export function runHistoricalBacktest(
+  rawCandles: CandleRow[],
+  config: BacktestConfig,
+  rfArtifact?: RandomForestArtifact | null,
+  minMlTimestamp?: number | null
+): BacktestResult {
+  if (config.strategy === 'ml_random_forest' && !rfArtifact) {
+    throw new Error(
+      'Random Forest model is not trained yet. Train the model on the AI/ML Prediction page first, or choose RSI + MACD Confluence / EMA Crossover.'
+    );
+  }
+
+  // Calculate indicators on full ordered dataset first (strictly causal) before filtering date range
+  const allEnriched = calculateIndicators(rawCandles);
+  let filtered: EnrichedCandle[] = allEnriched.filter((c) => {
+    if (config.startDate && c.date_str < config.startDate) return false;
+    if (config.endDate && c.date_str > config.endDate) return false;
+    return true;
+  });
+
+  // Prevent look-ahead / in-sample leakage when backtesting the trained Random Forest
+  if (config.strategy === 'ml_random_forest' && minMlTimestamp) {
+    const oosFiltered = filtered.filter((c) => c.timestamp >= minMlTimestamp);
+    if (oosFiltered.length >= 25) {
+      filtered = oosFiltered;
+    }
+  }
+
+  if (filtered.length < 25) {
+    throw new Error('Selected date range contains fewer than 25 candles. Expand the date range to run a valid backtest.');
+  }
+
+  const useAtrDynamic = config.useAtrDynamic ?? true;
+  const useAdxFilter = config.useAdxFilter ?? true;
+  const useConsecutiveLossCooldown = config.useConsecutiveLossCooldown ?? true;
+
+  const filteredPass = simulateBacktestPass(filtered, config, rfArtifact, {
+    useAtrDynamic,
+    useAdxFilter,
+    useConsecutiveLossCooldown,
+  });
+
+  const unfilteredPass = simulateBacktestPass(filtered, config, rfArtifact, {
+    useAtrDynamic: false,
+    useAdxFilter: false,
+    useConsecutiveLossCooldown: false,
+  });
+
+  const baselineComparison: BacktestBaselineComparison = {
+    filtered: {
+      winRatePct: filteredPass.metrics.winRatePct,
+      profitFactor: filteredPass.metrics.profitFactor,
+      maxDrawdownPct: filteredPass.metrics.maxDrawdownPct,
+      totalReturnPct: filteredPass.metrics.totalReturnPct,
+      netProfit: filteredPass.metrics.netProfit,
+      totalTrades: filteredPass.metrics.totalTrades,
+      sharpeRatio: filteredPass.metrics.sharpeRatio,
+    },
+    unfiltered: {
+      winRatePct: unfilteredPass.metrics.winRatePct,
+      profitFactor: unfilteredPass.metrics.profitFactor,
+      maxDrawdownPct: unfilteredPass.metrics.maxDrawdownPct,
+      totalReturnPct: unfilteredPass.metrics.totalReturnPct,
+      netProfit: unfilteredPass.metrics.netProfit,
+      totalTrades: unfilteredPass.metrics.totalTrades,
+      sharpeRatio: unfilteredPass.metrics.sharpeRatio,
+    },
+    blockedByAdxCount: filteredPass.blockedByAdxCount,
+    blockedByCooldownCount: filteredPass.blockedByCooldownCount,
+    atrDynamicTradesCount: filteredPass.atrDynamicTradesCount,
+    guardrailsApplied: {
+      atrDynamic: useAtrDynamic,
+      adxFilter: useAdxFilter,
+      consecutiveLossCooldown: useConsecutiveLossCooldown,
+      adxMinThreshold: config.adxMinThreshold ?? 18,
+      cooldownCandles: config.cooldownCandles ?? 6,
+    },
+  };
+
+  return {
+    backtestType: 'Index-Direction Spot Simulation (Not Options Contracts)',
+    strategy: config.strategy,
+    dateRange: `${filtered[0].date_str} to ${filtered[filtered.length - 1].date_str}`,
+    barsTested: filtered.length,
+    metrics: filteredPass.metrics,
+    baselineComparison,
+    equityCurve: filteredPass.equityCurve,
+    trades: filteredPass.trades.slice(-150).reverse(),
   };
 }
