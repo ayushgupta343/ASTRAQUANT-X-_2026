@@ -1,0 +1,6 @@
+{
+  "name": "ASTRAQUANT X-2026",
+  "description": "Institutional-grade algorithmic trading and applied AI platform for Bank NIFTY 5-minute market analysis, Random Forest prediction, backtesting, and paper trading.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
