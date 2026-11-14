@@ -17,6 +17,10 @@ export interface EnrichedCandle extends CandleRow {
   macdHist: number | null;
   ema20: number | null;
   sma50: number | null;
+  ema9: number | null;
+  ema21: number | null;
+  ema5: number | null;
+  ema9Ema21SpreadPct: number | null;
   return1: number | null;
   return3: number | null;
   volatility: number | null;
@@ -30,6 +34,9 @@ export interface EnrichedCandle extends CandleRow {
   adx: number | null;
   htfEma20Slope: number | null;
   htfRsi14: number | null;
+  mtfConfluenceScore: number | null;
+  rsiMomentumSlope: number | null;
+  macdHistAccel: number | null;
   timeSin: number;
   timeCos: number;
 }
@@ -320,7 +327,10 @@ export function calculateIndicators(candles: CandleRow[]): EnrichedCandle[] {
 
   const rsi = computeRSI(closes, 14);
   const { macdLine, signalLine, histLine } = computeMACD(closes, 12, 26, 9);
+  const ema5 = computeEMA(closes, 5);
+  const ema9 = computeEMA(closes, 9);
   const ema20 = computeEMA(closes, 20);
+  const ema21 = computeEMA(closes, 21);
   const sma50 = computeSMA(closes, 50);
   const atr = computeATR(sorted, 14);
   const adx = computeADX(sorted, 14);
@@ -387,6 +397,31 @@ export function calculateIndicators(candles: CandleRow[]): EnrichedCandle[] {
     const elapsed = Math.max(0, Math.min(375, mins - 555));
     const angle = (2 * Math.PI * elapsed) / 375;
 
+    const e5 = ema5[i];
+    const e9 = ema9[i];
+    const e21 = ema21[i];
+    const emaSpreadPct =
+      e9 !== null && e21 !== null && e21 > 0 ? Number((((e9 - e21) / e21) * 100).toFixed(4)) : null;
+
+    const rsiSlope =
+      i >= 2 && rsi[i] !== null && rsi[i - 2] !== null
+        ? Number((rsi[i]! - rsi[i - 2]!).toFixed(4))
+        : null;
+
+    const macdAccel =
+      i >= 1 && histLine[i] !== null && histLine[i - 1] !== null
+        ? Number((histLine[i]! - histLine[i - 1]!).toFixed(4))
+        : null;
+
+    const htfSlope = htfEma20Slope[i];
+    let mtfConfluenceScore: number | null = null;
+    if (e9 !== null && e21 !== null && htfSlope !== null) {
+      const c1 = e9 > e21 ? 1 : e9 < e21 ? -1 : 0;
+      const c2 = c.close > dayVwap ? 1 : c.close < dayVwap ? -1 : 0;
+      const c3 = htfSlope > 0 ? 1 : htfSlope < 0 ? -1 : 0;
+      mtfConfluenceScore = c1 + c2 + c3;
+    }
+
     return {
       ...c,
       rsi: rsi[i] !== null ? Number(rsi[i]!.toFixed(2)) : null,
@@ -395,6 +430,10 @@ export function calculateIndicators(candles: CandleRow[]): EnrichedCandle[] {
       macdHist: histLine[i] !== null ? Number(histLine[i]!.toFixed(2)) : null,
       ema20: ema20[i] !== null ? Number(ema20[i]!.toFixed(2)) : null,
       sma50: sma50[i] !== null ? Number(sma50[i]!.toFixed(2)) : null,
+      ema9: e9 !== null ? Number(e9.toFixed(2)) : null,
+      ema21: e21 !== null ? Number(e21.toFixed(2)) : null,
+      ema5: e5 !== null ? Number(e5.toFixed(2)) : null,
+      ema9Ema21SpreadPct: emaSpreadPct,
       return1: returns1[i] !== null ? Number((returns1[i]! * 100).toFixed(4)) : null,
       return3: returns3[i] !== null ? Number((returns3[i]! * 100).toFixed(4)) : null,
       volatility: volatility[i] !== null ? Number(volatility[i]!.toFixed(4)) : null,
@@ -406,8 +445,11 @@ export function calculateIndicators(candles: CandleRow[]): EnrichedCandle[] {
       atr: barAtr !== null ? Number(barAtr.toFixed(2)) : null,
       atrNormRange: atrNormRange !== null ? Number(atrNormRange.toFixed(4)) : null,
       adx: adx[i] !== null ? Number(adx[i]!.toFixed(2)) : null,
-      htfEma20Slope: htfEma20Slope[i],
+      htfEma20Slope: htfSlope,
       htfRsi14: htfRsi14[i],
+      mtfConfluenceScore,
+      rsiMomentumSlope: rsiSlope,
+      macdHistAccel: macdAccel,
       timeSin: Number(Math.sin(angle).toFixed(4)),
       timeCos: Number(Math.cos(angle).toFixed(4)),
     };

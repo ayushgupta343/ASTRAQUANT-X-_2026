@@ -69,7 +69,8 @@ export function initDatabase() {
       feature_importance_json TEXT NOT NULL,
       prediction_history_json TEXT NOT NULL,
       model_artifact_json TEXT NOT NULL,
-      min_confidence_threshold REAL DEFAULT 0.65,
+      min_confidence_threshold REAL DEFAULT 0.72,
+      target_mode TEXT DEFAULT 'trend_regime',
       high_conviction_json TEXT,
       walk_forward_json TEXT,
       created_at TEXT NOT NULL
@@ -215,7 +216,8 @@ export function initDatabase() {
     "ALTER TABLE paper_orders ADD COLUMN lots INTEGER DEFAULT 1",
     "ALTER TABLE paper_orders ADD COLUMN is_auto_executed INTEGER DEFAULT 0",
     "ALTER TABLE paper_orders ADD COLUMN rationale TEXT",
-    "ALTER TABLE ml_models ADD COLUMN min_confidence_threshold REAL DEFAULT 0.65",
+    "ALTER TABLE ml_models ADD COLUMN min_confidence_threshold REAL DEFAULT 0.72",
+    "ALTER TABLE ml_models ADD COLUMN target_mode TEXT DEFAULT 'trend_regime'",
     "ALTER TABLE ml_models ADD COLUMN high_conviction_json TEXT",
     "ALTER TABLE ml_models ADD COLUMN walk_forward_json TEXT",
     "ALTER TABLE paper_orders ADD COLUMN opened_candle_ts INTEGER",
@@ -257,7 +259,8 @@ export function initDatabase() {
         minSamplesSplit: 8,
         horizonCandles: 3,
         signalThresholdPct: 0.1,
-        minConfidenceThreshold: 0.65,
+        minConfidenceThreshold: 0.72,
+        targetMode: 'trend_regime',
         walkForwardEnabled: false,
       },
       trading: {
@@ -523,7 +526,10 @@ export function getAppSettingsObject() {
       minSamplesSplit: parsed.ml?.minSamplesSplit ?? 8,
       horizonCandles: parsed.ml?.horizonCandles ?? 3,
       signalThresholdPct: parsed.ml?.signalThresholdPct ?? 0.1,
-      minConfidenceThreshold: parsed.ml?.minConfidenceThreshold ?? 0.65,
+      minConfidenceThreshold: parsed.ml?.minConfidenceThreshold ?? 0.72,
+      targetMode: (parsed.ml?.targetMode === 'raw_return' ? 'raw_return' : 'trend_regime') as
+        | 'trend_regime'
+        | 'raw_return',
       walkForwardEnabled: Boolean(parsed.ml?.walkForwardEnabled ?? false),
     },
     trading: {

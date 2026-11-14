@@ -137,6 +137,7 @@ export const api = {
     maxDepth?: number;
     minSamplesSplit?: number;
     minConfidenceThreshold?: number;
+    targetMode?: 'trend_regime' | 'raw_return';
     walkForward?: boolean;
   }) =>
     request<ModelStatusResponse>('/api/model/train', {

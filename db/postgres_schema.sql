@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS ml_models (
   feature_importance_json JSONB NOT NULL,
   prediction_history_json JSONB NOT NULL,
   model_artifact_json JSONB NOT NULL,
-  min_confidence_threshold NUMERIC(4, 2) DEFAULT 0.65,
+  min_confidence_threshold NUMERIC(4, 2) DEFAULT 0.72,
+  target_mode TEXT DEFAULT 'trend_regime',
   high_conviction_json JSONB,
   walk_forward_json JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

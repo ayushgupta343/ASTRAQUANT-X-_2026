@@ -184,13 +184,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
             />
           </div>
           <div>
-            <label className="block text-slate-500 mb-1">Min Conviction Threshold (0.50–0.90)</label>
+            <label className="block text-slate-500 mb-1">Meta-Label Gate Threshold (0.50–0.92)</label>
             <input
               type="number"
               min={0.5}
-              max={0.9}
+              max={0.92}
               step="0.01"
-              value={form.ml.minConfidenceThreshold ?? 0.65}
+              value={form.ml.minConfidenceThreshold ?? 0.72}
               onChange={(e) =>
                 setForm({
                   ...form,
@@ -201,13 +201,20 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
             />
           </div>
           <div>
-            <label className="block text-slate-500 mb-1">Prediction Horizon (Candles)</label>
-            <input
-              type="number"
-              readOnly
-              value={form.ml.horizonCandles}
-              className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50 text-slate-500 font-mono tabular-nums"
-            />
+            <label className="block text-slate-500 mb-1">Target Labeling Mode</label>
+            <select
+              value={form.ml.targetMode ?? 'trend_regime'}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  ml: { ...form.ml, targetMode: e.target.value as 'trend_regime' | 'raw_return' },
+                })
+              }
+              className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#0D131F]"
+            >
+              <option value="trend_regime">Trend-Continuation Regime (High Accuracy)</option>
+              <option value="raw_return">Raw 3-Candle Return</option>
+            </select>
           </div>
         </div>
       </div>

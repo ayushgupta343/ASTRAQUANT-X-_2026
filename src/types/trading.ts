@@ -11,6 +11,7 @@ export type PageId =
   | 'settings';
 
 export type SignalClass = 'BUY' | 'SELL' | 'HOLD';
+export type TargetLabelMode = 'trend_regime' | 'raw_return';
 
 export type MarketFeedMode = 'historical_csv' | 'simulated_replay' | 'free_live_nse';
 
@@ -157,6 +158,13 @@ export interface EnrichedCandle {
   adx?: number | null;
   htfEma20Slope?: number | null;
   htfRsi14?: number | null;
+  ema9?: number | null;
+  ema21?: number | null;
+  ema5?: number | null;
+  ema9Ema21SpreadPct?: number | null;
+  mtfConfluenceScore?: number | null;
+  rsiMomentumSlope?: number | null;
+  macdHistAccel?: number | null;
   timeSin?: number;
   timeCos?: number;
 }
@@ -231,6 +239,7 @@ export interface MarketOverviewResponse {
 
 export interface HighConvictionMetrics {
   minConfidenceThreshold: number;
+  minAdxGate?: number;
   totalTestBars: number;
   directionalSignals: number;
   directionalHits: number;
@@ -243,6 +252,7 @@ export interface HighConvictionMetrics {
   sellPrecision: number;
   tradeCoveragePct: number;
   avgDirectionalConfidence: number;
+  avgMetaProbability?: number;
 }
 
 export interface WalkForwardFold {
@@ -284,6 +294,9 @@ export interface ModelStatusResponse {
   testSize?: number;
   dateRange?: string;
   minConfidenceThreshold?: number;
+  minAdxGate?: number;
+  targetMode?: TargetLabelMode;
+  labelingMode?: string;
   walkForwardEnabled?: boolean;
   metrics?: {
     accuracy: number;
@@ -307,6 +320,8 @@ export interface ModelStatusResponse {
     rawPredicted?: SignalClass;
     thresholdGated?: boolean;
     confidence: number;
+    metaProbability?: number;
+    adx?: number | null;
     futureReturnPct: number;
   }>;
   trainedAt?: string;
@@ -519,6 +534,7 @@ export interface AppSettings {
     horizonCandles: number;
     signalThresholdPct: number;
     minConfidenceThreshold?: number;
+    targetMode?: TargetLabelMode;
     walkForwardEnabled?: boolean;
   };
   trading: {

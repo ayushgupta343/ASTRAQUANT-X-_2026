@@ -212,9 +212,9 @@ function simulateBacktestPass(
     // 2. Generate causal signal from previous closed bar (prevBar) to execute at current bar open (zero look-ahead)
     let signal: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
     if (config.strategy === 'ml_random_forest' && rfArtifact) {
-      const vec = extractFeatureVector(prevBar);
+      const vec = extractFeatureVector(prevBar, rfArtifact.featureNames);
       if (vec) {
-        const pred = predictWithForest(rfArtifact, vec);
+        const pred = predictWithForest(rfArtifact, vec, { adx: prevBar.adx });
         signal = pred.signal;
       }
     } else if (config.strategy === 'rsi_macd_confluence') {

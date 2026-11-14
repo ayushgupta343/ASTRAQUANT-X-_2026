@@ -234,6 +234,7 @@ export default function App() {
     maxDepth: number;
     minSamplesSplit: number;
     minConfidenceThreshold?: number;
+    targetMode?: 'trend_regime' | 'raw_return';
     walkForward?: boolean;
   }) => {
     const trained = await api.trainModel(
@@ -241,7 +242,8 @@ export default function App() {
         nEstimators: settings?.ml.nEstimators ?? 30,
         maxDepth: settings?.ml.maxDepth ?? 6,
         minSamplesSplit: settings?.ml.minSamplesSplit ?? 8,
-        minConfidenceThreshold: settings?.ml.minConfidenceThreshold ?? 0.65,
+        minConfidenceThreshold: settings?.ml.minConfidenceThreshold ?? 0.72,
+        targetMode: settings?.ml.targetMode ?? 'trend_regime',
         walkForward: settings?.ml.walkForwardEnabled ?? false,
       }
     );

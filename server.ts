@@ -21,6 +21,8 @@ import {
   clampConfidenceThreshold,
   extractFeatureVector,
   generateSignalForCandle,
+  getLabelingModeDescription,
+  normalizeTargetMode,
   predictWithForest,
   trainRandomForestPipeline,
 } from './server/randomForest.ts';
@@ -99,6 +101,7 @@ function getLatestTrainedModel(datasetId?: number) {
         prediction_history_json: string;
         model_artifact_json: string;
         min_confidence_threshold?: number | null;
+        target_mode?: string | null;
         high_conviction_json?: string | null;
         walk_forward_json?: string | null;
         created_at: string;
@@ -703,6 +706,8 @@ app.get('/api/model/status', (_req, res) => {
         status: 'Not trained',
         reason: 'No active dataset loaded.',
         minConfidenceThreshold: appSettings.ml.minConfidenceThreshold,
+        targetMode: appSettings.ml.targetMode,
+        labelingMode: getLabelingModeDescription(appSettings.ml.targetMode),
         walkForwardEnabled: appSettings.ml.walkForwardEnabled,
       });
     }
@@ -716,6 +721,8 @@ app.get('/api/model/status', (_req, res) => {
         datasetSize: active.record_count,
         dateRange: `${active.start_date} to ${active.end_date}`,
         minConfidenceThreshold: appSettings.ml.minConfidenceThreshold,
+        targetMode: appSettings.ml.targetMode,
+        labelingMode: getLabelingModeDescription(appSettings.ml.targetMode),
         walkForwardEnabled: appSettings.ml.walkForwardEnabled,
       });
     }
@@ -723,6 +730,7 @@ app.get('/api/model/status', (_req, res) => {
     const minConfidenceThreshold = clampConfidenceThreshold(
       modelRow.min_confidence_threshold ?? appSettings.ml.minConfidenceThreshold
     );
+    const targetMode = normalizeTargetMode(modelRow.target_mode ?? appSettings.ml.targetMode);
 
     res.json({
       status: 'Trained',
@@ -737,6 +745,8 @@ app.get('/api/model/status', (_req, res) => {
       testSize: modelRow.test_size,
       dateRange: modelRow.date_range,
       minConfidenceThreshold,
+      targetMode,
+      labelingMode: getLabelingModeDescription(targetMode),
       walkForwardEnabled: Boolean(modelRow.walk_forward_json),
       metrics: {
         accuracy: modelRow.accuracy,
@@ -789,16 +799,18 @@ app.post('/api/model/train', async (req, res) => {
       Math.max(4, Number(req.body?.minSamplesSplit ?? appSettings.ml.minSamplesSplit ?? 8))
     );
     const minConfidenceThreshold = clampConfidenceThreshold(
-      req.body?.minConfidenceThreshold ?? appSettings.ml.minConfidenceThreshold ?? 0.65
+      req.body?.minConfidenceThreshold ?? appSettings.ml.minConfidenceThreshold ?? 0.72
     );
+    const targetMode = normalizeTargetMode(req.body?.targetMode ?? appSettings.ml.targetMode);
     const walkForward = Boolean(req.body?.walkForward ?? appSettings.ml.walkForwardEnabled ?? false);
 
-    // Persist active ML hyperparameters & conviction threshold in settings
+    // Persist active ML hyperparameters, target mode & conviction threshold in settings
     const now = new Date().toISOString();
     appSettings.ml.nEstimators = nEstimators;
     appSettings.ml.maxDepth = maxDepth;
     appSettings.ml.minSamplesSplit = minSamplesSplit;
     appSettings.ml.minConfidenceThreshold = minConfidenceThreshold;
+    appSettings.ml.targetMode = targetMode;
     appSettings.ml.walkForwardEnabled = walkForward;
     db.prepare('UPDATE app_settings SET settings_json = ?, updated_at = ? WHERE id = 1').run(
       JSON.stringify(appSettings),
@@ -811,6 +823,7 @@ app.post('/api/model/train', async (req, res) => {
       minSamplesSplit,
       horizonCandles: 3,
       minConfidenceThreshold,
+      targetMode,
       walkForward,
     });
 
@@ -822,8 +835,8 @@ app.post('/api/model/train', async (req, res) => {
         accuracy, balanced_accuracy, precision_macro, recall_macro, f1_macro,
         confusion_matrix_json, class_distribution_json, feature_importance_json,
         prediction_history_json, model_artifact_json,
-        min_confidence_threshold, high_conviction_json, walk_forward_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        min_confidence_threshold, target_mode, high_conviction_json, walk_forward_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
 
     const modelRes = insertModel.run(
@@ -847,6 +860,7 @@ app.post('/api/model/train', async (req, res) => {
       JSON.stringify(evaluation.predictionHistory),
       JSON.stringify(evaluation.artifact),
       minConfidenceThreshold,
+      targetMode,
       JSON.stringify(evaluation.highConviction),
       evaluation.walkForward ? JSON.stringify(evaluation.walkForward) : null,
       now
@@ -951,6 +965,8 @@ app.post('/api/model/train', async (req, res) => {
       testSize: evaluation.testSize,
       dateRange: evaluation.dateRange,
       minConfidenceThreshold,
+      targetMode,
+      labelingMode: evaluation.labelingMode,
       walkForwardEnabled: walkForward,
       metrics: {
         accuracy: evaluation.accuracy,
@@ -997,12 +1013,15 @@ app.post('/api/model/predict', (req, res) => {
         ? enriched[idxParam]
         : enriched[enriched.length - 1];
 
-    const vec = extractFeatureVector(targetCandle);
+    const vec = extractFeatureVector(targetCandle, artifact.featureNames);
     if (!vec) {
       return res.status(400).json({ error: 'Selected candle lacks sufficient indicator warm-up history.' });
     }
 
-    const pred = predictWithForest(artifact, vec, minConfidenceThreshold);
+    const pred = predictWithForest(artifact, vec, {
+      minConfidenceOverride: minConfidenceThreshold,
+      adx: targetCandle.adx,
+    });
     const signal = generateSignalForCandle(artifact, targetCandle, minConfidenceThreshold);
 
     res.json({
